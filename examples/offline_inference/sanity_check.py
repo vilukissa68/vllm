@@ -3,6 +3,10 @@
 from vllm import LLM, SamplingParams
 
 if __name__ == "__main__":
-    llm = LLM(model="facebook/opt-125m", enforce_eager=False)
+    print("Starting sanity check...")
+    llm = LLM(
+        model="Qwen/Qwen3-0.6B",
+        enforce_eager=True,
+    )
     print(llm.generate("Hello world"))
     print("Sanity check passed!")
