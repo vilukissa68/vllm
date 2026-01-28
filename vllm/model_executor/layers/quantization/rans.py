@@ -11,10 +11,14 @@ from vllm.model_executor.layers.quantization.base_config import (QuantizationCon
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 
 try:
-    from comp_inference import rans_decompress_module_weight, reconstruct_from_exp_and_mantissa
+    import comp_inference as rans_lib
     from comp_inference import ccore
-except ImportError:
-    print("Warning: comp_inference module not found. rANS decompression will not be available.")
+    print("SUCCESS: comp_inference loaded.")
+except Exception as e:
+    # Print the FULL error so we know if it's "ModuleNotFound" or "libc10.so"
+    print(f"CRITICAL ERROR loading comp_inference: {e}")
+    # Raise it so we don't fail silently later
+    raise e
 
 class RansConfig(QuantizationConfig):
 
@@ -44,7 +48,8 @@ class RansConfig(QuantizationConfig):
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> QuantizeMethodBase | None:
         if isinstance(layer, LinearBase):
-            return RansLinearMethod(layer, prefix, self.block_size)
+            #return RansLinearMethod(layer, prefix, self.block_size)
+            return RansLinearMethod(self)
         return None
 
 class RansLinearMethod(LinearMethodBase):
@@ -59,6 +64,14 @@ class RansLinearMethod(LinearMethodBase):
                        params_dtype: torch.dtype,
                        **extra_weight_attrs):
 
+        # DEFINE THE CUSTOM LOADER
+        def rans_weight_loader(param: Parameter, loaded_weight: torch.Tensor, some_other_args: Any = None):
+            # Allow resizing
+            if param.numel() != loaded_weight.numel():
+                param.data = loaded_weight
+            else:
+                param.data.copy_(loaded_weight)
+
         # Handle possible bias
         if extra_weight_attrs.get("bias", False):
             print("[Warning] Bias re-initialization for rANS quantization is not verified.")
@@ -68,24 +81,40 @@ class RansLinearMethod(LinearMethodBase):
         # Initialize rANS parameters
         # Meta Info
         layer.rans_info = Parameter(torch.empty(0, dtype=torch.int32), requires_grad=False)
+        setattr(layer.rans_info, "weight_loader", rans_weight_loader)
         
         # Exponent
         layer.rans_exp_stream = Parameter(torch.empty(0, dtype=torch.uint8), requires_grad=False)
         layer.rans_exp_states = Parameter(torch.empty(0, dtype=torch.int32), requires_grad=False)
         layer.rans_exp_sizes  = Parameter(torch.empty(0, dtype=torch.int32), requires_grad=False)
-        layer.rans_exp_freqs  = Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False)
-        layer.rans_exp_cdf    = Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False)
+        layer.rans_exp_freqs  = Parameter(torch.empty(0, dtype=torch.uint16), requires_grad=False)
+        layer.rans_exp_cdf    = Parameter(torch.empty(0, dtype=torch.uint16), requires_grad=False)
+
+        setattr(layer.rans_exp_stream, "weight_loader", rans_weight_loader)
+        setattr(layer.rans_exp_states, "weight_loader", rans_weight_loader)
+        setattr(layer.rans_exp_sizes,  "weight_loader", rans_weight_loader)
+        setattr(layer.rans_exp_freqs,  "weight_loader", rans_weight_loader)
+        setattr(layer.rans_exp_cdf,    "weight_loader", rans_weight_loader)
         
         # Mantissa
         layer.rans_man_stream = Parameter(torch.empty(0, dtype=torch.uint8), requires_grad=False)
         layer.rans_man_states = Parameter(torch.empty(0, dtype=torch.int32), requires_grad=False)
         layer.rans_man_sizes  = Parameter(torch.empty(0, dtype=torch.int32), requires_grad=False)
-        layer.rans_man_freqs  = Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False)
-        layer.rans_man_cdf    = Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False)
+        layer.rans_man_freqs  = Parameter(torch.empty(0, dtype=torch.uint16), requires_grad=False)
+        layer.rans_man_cdf    = Parameter(torch.empty(0, dtype=torch.uint16), requires_grad=False)
+
+        setattr(layer.rans_man_stream, "weight_loader", rans_weight_loader)
+        setattr(layer.rans_man_states, "weight_loader", rans_weight_loader)
+        setattr(layer.rans_man_sizes, "weight_loader", rans_weight_loader)
+        setattr(layer.rans_man_freqs, "weight_loader", rans_weight_loader)
+        setattr(layer.rans_man_cdf, "weight_loader", rans_weight_loader)
         
         # Fallbacks
         layer.rans_exp_raw = Parameter(torch.empty(0, dtype=torch.bfloat16), requires_grad=False)
         layer.rans_man_raw = Parameter(torch.empty(0, dtype=torch.uint8), requires_grad=False)
+
+        setattr(layer.rans_exp_raw, "weight_loader", rans_weight_loader)
+        setattr(layer.rans_man_raw, "weight_loader", rans_weight_loader)
 
 
     def apply(self,
@@ -100,19 +129,18 @@ class RansLinearMethod(LinearMethodBase):
         is_man_compressed = info[4].item()
 
         if is_exp_compressed:
+            print("Decompressing Exponent via rANS...")
             num_streams = info[3].item()
 
             # Move exponent to GPU for decompression
-            exp_stream_gpu = layer.rans_exp_stream.to(torch.device(x.device), non_blocking=True)
-
-            exp_states_gpu = layer.rans_exp_states.to(x.device, non_blocking=True)
-            exp_sizes_gpu  = layer.rans_exp_sizes.to(x.device, non_blocking=True)
-            exp_freqs_gpu  = layer.rans_exp_freqs.to(x.device, non_blocking=True)
-            exp_cdf_gpu    = layer.rans_exp_cdf.to(x.device, non_blocking=True)
+            exp_stream_gpu = layer.rans_exp_stream.to(torch.device(x.device), dtype=torch.uint8, non_blocking=True)
+            exp_states_gpu = layer.rans_exp_states.to(x.device, dtype=torch.int32, non_blocking=True)
+            exp_sizes_gpu  = layer.rans_exp_sizes.to(x.device, dtype=torch.int32, non_blocking=True)
+            exp_freqs_gpu  = layer.rans_exp_freqs.to(x.device,dtype=torch.uint16, non_blocking=True)
+            exp_cdf_gpu    = layer.rans_exp_cdf.to(x.device, dtype=torch.uint16, non_blocking=True)
             
             # Alloc Output
             raw_exponent = torch.empty(expanded_size, dtype=torch.uint8, device=x.device).flatten()
-            
 
             # Decompress
             manager = ccore.RansManager(exp_stream_gpu.numel())
@@ -127,11 +155,11 @@ class RansLinearMethod(LinearMethodBase):
             num_streams = info[5].item()
 
             # Move mantissa to GPU for decompression
-            man_stream_gpu = layer.rans_man_stream.to(x.device, non_blocking=True)
-            man_states_gpu = layer.rans_man_states.to(x.device, non_blocking=True)
-            man_sizes_gpu  = layer.rans_man_sizes.to(x.device, non_blocking=True)
-            man_freqs_gpu  = layer.rans_man_freqs.to(x.device, non_blocking=True)
-            man_cdf_gpu    = layer.rans_man_cdf.to(x.device, non_blocking=True)
+            man_stream_gpu = layer.rans_man_stream.to(x.device, dtype=torch.uint8, non_blocking=True)
+            man_states_gpu = layer.rans_man_states.to(x.device, dtype=torch.int32, non_blocking=True)
+            man_sizes_gpu  = layer.rans_man_sizes.to(x.device, dtype=torch.int32, non_blocking=True)
+            man_freqs_gpu  = layer.rans_man_freqs.to(x.device, dtype=torch.uint16, non_blocking=True)
+            man_cdf_gpu    = layer.rans_man_cdf.to(x.device, dtype=torch.utin16, non_blocking=True)
             
             # Alloc Output
             raw_mantissa = torch.empty(expanded_size, dtype=torch.uint8, device=x.device).flatten()
