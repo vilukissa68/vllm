@@ -953,6 +953,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         disable_tp: bool = False,
         v_head_size: int | None = None,
     ):
+        print("QKVParallelLinear init")
         self.hidden_size = hidden_size
         self.head_size = head_size
         self.v_head_size = v_head_size if v_head_size is not None else head_size

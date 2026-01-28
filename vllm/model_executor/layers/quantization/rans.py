@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 
-from typing import Any, List, Dict, Optional 
+from typing import Any, List, Dict, Optional
 
 import torch
 from torch.nn import Parameter
 
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.layers.quantization import QuantizationMethods
-from vllm.model_executor.layers.quantization.base_config import (QuantizationConfig, QuantizeMethodBase)
-from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    LinearMethodBase,
+    QKVParallelLinear,
+    MergedColumnParallelLinear,
+)
 
 try:
-    import comp_inference as rans_lib
-    from comp_inference import ccore
+    from comp_inference import ccore, reconstruct_from_exp_and_mantissa
+
     print("SUCCESS: comp_inference loaded.")
 except Exception as e:
-    # Print the FULL error so we know if it's "ModuleNotFound" or "libc10.so"
     print(f"CRITICAL ERROR loading comp_inference: {e}")
-    # Raise it so we don't fail silently later
     raise e
 
-class RansConfig(QuantizationConfig):
 
+class RansConfig(QuantizationConfig):
     def __init__(self, block_size: int = 4096):
         self.block_size = block_size
 
@@ -46,26 +52,33 @@ class RansConfig(QuantizationConfig):
     def from_config(cls, config: dict) -> "RansConfig":
         return cls()
 
-    def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> QuantizeMethodBase | None:
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> QuantizeMethodBase | None:
         if isinstance(layer, LinearBase):
-            #return RansLinearMethod(layer, prefix, self.block_size)
+            # return RansLinearMethod(layer, prefix, self.block_size)
             return RansLinearMethod(self)
         return None
+
 
 class RansLinearMethod(LinearMethodBase):
     def __init__(self, quant_config: RansConfig):
         self.quant_config = quant_config
 
-    def create_weights(self, layer: torch.nn.Module,
-                       input_size_per_partition: int,
-                       output_partition_sizes: List[int],
-                       input_size: int,
-                       output_size: int,
-                       params_dtype: torch.dtype,
-                       **extra_weight_attrs):
-
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
         # DEFINE THE CUSTOM LOADER
-        def rans_weight_loader(param: Parameter, loaded_weight: torch.Tensor, some_other_args: Any = None):
+        def rans_weight_loader(
+            param: Parameter, loaded_weight: torch.Tensor, some_other_args: Any = None
+        ):
             # Allow resizing
             if param.numel() != loaded_weight.numel():
                 param.data = loaded_weight
@@ -74,116 +87,255 @@ class RansLinearMethod(LinearMethodBase):
 
         # Handle possible bias
         if extra_weight_attrs.get("bias", False):
-            print("[Warning] Bias re-initialization for rANS quantization is not verified.")
+            print(
+                "[Warning] Bias re-initialization for rANS quantization is not verified."
+            )
             layer.bias = Parameter(torch.empty(output_size, dtype=params_dtype))
             setattr(layer.bias, "force_gpu", True)
 
         # Initialize rANS parameters
-        # Meta Info
-        layer.rans_info = Parameter(torch.empty(0, dtype=torch.int32), requires_grad=False)
-        setattr(layer.rans_info, "weight_loader", rans_weight_loader)
-        
-        # Exponent
-        layer.rans_exp_stream = Parameter(torch.empty(0, dtype=torch.uint8), requires_grad=False)
-        layer.rans_exp_states = Parameter(torch.empty(0, dtype=torch.int32), requires_grad=False)
-        layer.rans_exp_sizes  = Parameter(torch.empty(0, dtype=torch.int32), requires_grad=False)
-        layer.rans_exp_freqs  = Parameter(torch.empty(0, dtype=torch.uint16), requires_grad=False)
-        layer.rans_exp_cdf    = Parameter(torch.empty(0, dtype=torch.uint16), requires_grad=False)
-
-        setattr(layer.rans_exp_stream, "weight_loader", rans_weight_loader)
-        setattr(layer.rans_exp_states, "weight_loader", rans_weight_loader)
-        setattr(layer.rans_exp_sizes,  "weight_loader", rans_weight_loader)
-        setattr(layer.rans_exp_freqs,  "weight_loader", rans_weight_loader)
-        setattr(layer.rans_exp_cdf,    "weight_loader", rans_weight_loader)
-        
-        # Mantissa
-        layer.rans_man_stream = Parameter(torch.empty(0, dtype=torch.uint8), requires_grad=False)
-        layer.rans_man_states = Parameter(torch.empty(0, dtype=torch.int32), requires_grad=False)
-        layer.rans_man_sizes  = Parameter(torch.empty(0, dtype=torch.int32), requires_grad=False)
-        layer.rans_man_freqs  = Parameter(torch.empty(0, dtype=torch.uint16), requires_grad=False)
-        layer.rans_man_cdf    = Parameter(torch.empty(0, dtype=torch.uint16), requires_grad=False)
-
-        setattr(layer.rans_man_stream, "weight_loader", rans_weight_loader)
-        setattr(layer.rans_man_states, "weight_loader", rans_weight_loader)
-        setattr(layer.rans_man_sizes, "weight_loader", rans_weight_loader)
-        setattr(layer.rans_man_freqs, "weight_loader", rans_weight_loader)
-        setattr(layer.rans_man_cdf, "weight_loader", rans_weight_loader)
-        
-        # Fallbacks
-        layer.rans_exp_raw = Parameter(torch.empty(0, dtype=torch.bfloat16), requires_grad=False)
-        layer.rans_man_raw = Parameter(torch.empty(0, dtype=torch.uint8), requires_grad=False)
-
-        setattr(layer.rans_exp_raw, "weight_loader", rans_weight_loader)
-        setattr(layer.rans_man_raw, "weight_loader", rans_weight_loader)
-
-
-    def apply(self,
-              layer: torch.nn.Module,
-              x: torch.Tensor,
-              bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-
-        # Decompress the weights using rANS
-        info = layer.rans_info # NOTE: Convert to list
-        expanded_size = info[1].item() # original weight numel
-        is_exp_compressed = info[2].item()
-        is_man_compressed = info[4].item()
-
-        if is_exp_compressed:
-            print("Decompressing Exponent via rANS...")
-            num_streams = info[3].item()
-
-            # Move exponent to GPU for decompression
-            exp_stream_gpu = layer.rans_exp_stream.to(torch.device(x.device), dtype=torch.uint8, non_blocking=True)
-            exp_states_gpu = layer.rans_exp_states.to(x.device, dtype=torch.int32, non_blocking=True)
-            exp_sizes_gpu  = layer.rans_exp_sizes.to(x.device, dtype=torch.int32, non_blocking=True)
-            exp_freqs_gpu  = layer.rans_exp_freqs.to(x.device,dtype=torch.uint16, non_blocking=True)
-            exp_cdf_gpu    = layer.rans_exp_cdf.to(x.device, dtype=torch.uint16, non_blocking=True)
-            
-            # Alloc Output
-            raw_exponent = torch.empty(expanded_size, dtype=torch.uint8, device=x.device).flatten()
-
-            # Decompress
-            manager = ccore.RansManager(exp_stream_gpu.numel())
-            manager.decompress_into(
-                exp_stream_gpu, exp_states_gpu, exp_sizes_gpu, num_streams,
-                exp_freqs_gpu, exp_cdf_gpu, raw_exponent
+        def create_rans_params(prefix=""):
+            p = "_" if prefix else ""
+            # Meta Info
+            layer.rans_info = Parameter(
+                torch.empty(0, dtype=torch.int32), requires_grad=False
             )
-        else: # Fallback to raw
-            raw_exponent = layer.rans_exp_raw.to(x.device, non_blocking=True).flatten()
+            setattr(layer.rans_info, "weight_loader", rans_weight_loader)
 
-        if is_man_compressed:
-            num_streams = info[5].item()
-
-            # Move mantissa to GPU for decompression
-            man_stream_gpu = layer.rans_man_stream.to(x.device, dtype=torch.uint8, non_blocking=True)
-            man_states_gpu = layer.rans_man_states.to(x.device, dtype=torch.int32, non_blocking=True)
-            man_sizes_gpu  = layer.rans_man_sizes.to(x.device, dtype=torch.int32, non_blocking=True)
-            man_freqs_gpu  = layer.rans_man_freqs.to(x.device, dtype=torch.uint16, non_blocking=True)
-            man_cdf_gpu    = layer.rans_man_cdf.to(x.device, dtype=torch.utin16, non_blocking=True)
-            
-            # Alloc Output
-            raw_mantissa = torch.empty(expanded_size, dtype=torch.uint8, device=x.device).flatten()
-            
-            # Decompress
-            manager = ccore.RansManager(man_stream_gpu.numel())
-            manager.decompress_into(
-                man_stream_gpu, man_states_gpu, man_sizes_gpu, num_streams,
-                man_freqs_gpu, man_cdf_gpu, raw_mantissa
+            # Exponent
+            setattr(
+                layer,
+                f"{prefix}{p}rans_info",
+                Parameter(torch.empty(0, dtype=torch.int32), requires_grad=False),
             )
-        else: # Fallback to raw
-            raw_mantissa = layer.rans_man_raw.to(x.device, non_blocking=True).flatten()
+            setattr(
+                layer,
+                f"{prefix}{p}rans_exp_stream",
+                Parameter(torch.empty(0, dtype=torch.uint8), requires_grad=False),
+            )
+            setattr(
+                layer,
+                f"{prefix}{p}rans_exp_states",
+                Parameter(torch.empty(0, dtype=torch.int32), requires_grad=False),
+            )
+            setattr(
+                layer,
+                f"{prefix}{p}rans_exp_sizes",
+                Parameter(torch.empty(0, dtype=torch.int32), requires_grad=False),
+            )
+            setattr(
+                layer,
+                f"{prefix}{p}rans_exp_freqs",
+                Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False),
+            )
+            setattr(
+                layer,
+                f"{prefix}{p}rans_exp_cdf",
+                Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False),
+            )
 
-        # Reconstruct bf16 weights
-        weight = reconstruct_from_exp_and_mantissa(
-            raw_exponent,
-            raw_mantissa,
-            dtype=torch.bfloat16
-        )
+            setattr(
+                getattr(layer, f"{prefix}{p}rans_exp_stream"),
+                "weight_loader",
+                rans_weight_loader,
+            )
+            setattr(
+                getattr(layer, f"{prefix}{p}rans_exp_states"),
+                "weight_loader",
+                rans_weight_loader,
+            )
+            setattr(
+                getattr(layer, f"{prefix}{p}rans_exp_sizes"),
+                "weight_loader",
+                rans_weight_loader,
+            )
+            setattr(
+                getattr(layer, f"{prefix}{p}rans_exp_freqs"),
+                "weight_loader",
+                rans_weight_loader,
+            )
+            setattr(
+                getattr(layer, f"{prefix}{p}rans_exp_cdf"),
+                "weight_loader",
+                rans_weight_loader,
+            )
 
-        # Reshape back to original shape
-        rank = info[6].item()
-        shape = torch.Size(info[7 : 7+rank].tolist())
-        weight = weight.reshape(shape)
+            # Mantissa
+            setattr(
+                layer,
+                f"{prefix}{p}rans_man_stream",
+                Parameter(torch.empty(0, dtype=torch.uint8), requires_grad=False),
+            )
+            setattr(
+                layer,
+                f"{prefix}{p}rans_man_states",
+                Parameter(torch.empty(0, dtype=torch.int32), requires_grad=False),
+            )
+            setattr(
+                layer,
+                f"{prefix}{p}rans_man_sizes",
+                Parameter(torch.empty(0, dtype=torch.int32), requires_grad=False),
+            )
+            setattr(
+                layer,
+                f"{prefix}{p}rans_man_freqs",
+                Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False),
+            )
+            setattr(
+                layer,
+                f"{prefix}{p}rans_man_cdf",
+                Parameter(torch.empty(0, dtype=torch.int16), requires_grad=False),
+            )
+
+            setattr(
+                getattr(layer, f"{prefix}{p}rans_man_stream"),
+                "weight_loader",
+                rans_weight_loader,
+            )
+            setattr(
+                getattr(layer, f"{prefix}{p}rans_man_states"),
+                "weight_loader",
+                rans_weight_loader,
+            )
+            setattr(
+                getattr(layer, f"{prefix}{p}rans_man_sizes"),
+                "weight_loader",
+                rans_weight_loader,
+            )
+            setattr(
+                getattr(layer, f"{prefix}{p}rans_man_freqs"),
+                "weight_loader",
+                rans_weight_loader,
+            )
+            setattr(
+                getattr(layer, f"{prefix}{p}rans_man_cdf"),
+                "weight_loader",
+                rans_weight_loader,
+            )
+
+            # Fallbacks
+            setattr(
+                layer,
+                f"{prefix}{p}rans_exp_raw",
+                Parameter(torch.empty(0, dtype=torch.bfloat16), requires_grad=False),
+            )
+            setattr(
+                layer,
+                f"{prefix}{p}rans_man_raw",
+                Parameter(torch.empty(0, dtype=torch.bfloat16), requires_grad=False),
+            )
+
+            setattr(
+                getattr(layer, f"{prefix}{p}rans_exp_raw"),
+                "weight_loader",
+                rans_weight_loader,
+            )
+            setattr(
+                getattr(layer, f"{prefix}{p}rans_man_raw"),
+                "weight_loader",
+                rans_weight_loader,
+            )
+
+        if isinstance(layer, QKVParallelLinear):
+            create_rans_params("q")
+            create_rans_params("k")
+            create_rans_params("v")
+            layer.is_split_qkv = True
+
+        elif isinstance(layer, MergedColumnParallelLinear):
+            create_rans_params("gate")
+            create_rans_params("up")
+            layer.is_split_gate_up = True
+
+        else:
+            create_rans_params("")
+            layer.is_split_qkv = False
+            layer.is_split_gate_up = False
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Helper to decompress one specific set
+        def decompress_part(prefix=""):
+            p = "_" if prefix else ""
+
+            # 1. Get Params by name
+            info = getattr(layer, f"{prefix}{p}rans_info")
+            expanded_size = info[1].item()
+
+            if is_exp_compressed:
+                print("Decompressing Exponent via rANS...")
+                stream = getattr(layer, f"{prefix}{p}rans_exp_stream")
+                states = getattr(layer, f"{prefix}{p}rans_exp_states")
+                sizes = getattr(layer, f"{prefix}{p}rans_exp_sizes")
+                freqs = getattr(layer, f"{prefix}{p}rans_exp_freqs")
+                cdf = getattr(layer, f"{prefix}{p}rans_exp_cdf")
+
+                num_streams = info[3].item()
+
+                raw_exponent = torch.empty(
+                    expanded_size, dtype=torch.uint8, device=x.device
+                )
+
+                manager = ccore.RansManager(stream.numel())
+                manager.decompress_into(
+                    stream, states, sizes, num_streams, freqs, cdf, raw_exponent
+                )
+            else:
+                raw_exponent = (
+                    getattr(layer, f"{prefix}{p}rans_exp_raw")
+                    .to(x.device, non_blocking=True)
+                    .flatten()
+                )
+
+            if is_man_compressed:
+                print("Decompressing Mantissa via rANS...")
+                stream = getattr(layer, f"{prefix}{p}rans_man_stream")
+                states = getattr(layer, f"{prefix}{p}rans_man_states")
+                sizes = getattr(layer, f"{prefix}{p}rans_man_sizes")
+                freqs = getattr(layer, f"{prefix}{p}rans_man_freqs")
+                cdf = getattr(layer, f"{prefix}{p}rans_man_cdf")
+
+                num_streams = info[5].item()
+                raw_mantissa = torch.empty(
+                    expanded_size, dtype=torch.uint8, device=x.device
+                )
+            else:
+                raw_mantissa = (
+                    getattr(layer, f"{prefix}{p}rans_man_raw")
+                    .to(x.device, non_blocking=True)
+                    .flatten()
+                )
+
+            # 4. Reconstruct & Reshape
+            weight = reconstruct_from_exp_and_mantissa(
+                raw_exponent, raw_mantissa, dtype=torch.bfloat16
+            )
+
+            rank = info[6].item()
+            shape = torch.Size(info[7 : 7 + rank].tolist())
+            return weight.view(shape)
+
+        if getattr(layer, "is_split_qkv", False):
+            # Decompress 3 parts
+            w_q = decompress_part("q")
+            w_k = decompress_part("k")
+            w_v = decompress_part("v")
+
+            # Fuse on GPU (Fast)
+            # Output dim is 0 for Linear weights
+            weight = torch.cat([w_q, w_k, w_v], dim=0)
+
+        elif getattr(layer, "is_split_gate_up", False):
+            w_gate = decompress_part("gate")
+            w_up = decompress_part("up")
+            weight = torch.cat([w_gate, w_up], dim=0)
+
+        else:
+            weight = decompress_part("")
 
         # Apply linear
         result = torch.nn.functional.linear(x, weight, bias)
