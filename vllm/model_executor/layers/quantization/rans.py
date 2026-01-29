@@ -148,20 +148,19 @@ class RansLinearMethod(LinearMethodBase):
             setattr(man_raw, "weight_loader", rans_weight_loader)
 
         if isinstance(layer, QKVParallelLinear):
+            # Handle fused QKV
             create_rans_params("")
-            create_rans_params("")
-            create_rans_params("")
-            layer.is_split_qkv = True
+            layer.is_fused_qkv = True
 
         elif isinstance(layer, MergedColumnParallelLinear):
+            # Handle fused Gate Up
             create_rans_params("")
-            create_rans_params("")
-            layer.is_split_gate_up = True
+            layer.is_fused_gate_up = True
 
         else:
             create_rans_params("")
-            layer.is_split_qkv = False
-            layer.is_split_gate_up = False
+            layer.is_fused_qkv = False
+            layer.is_fused_gate_up = False
 
     def apply(
         self,
@@ -233,20 +232,13 @@ class RansLinearMethod(LinearMethodBase):
             shape = torch.Size(info[7 : 7 + rank].tolist())
             return weight.view(shape)
 
-        if hasattr(layer, "is_split_qkv") and layer.is_split_qkv:
-            # Decompress 3 parts
-            w_q = decompress_part("")
-            w_k = decompress_part("")
-            w_v = decompress_part("")
+        if hasattr(layer, "is_fused_qkv") and layer.is_fused_qkv:
+            # Decompress fused QKV
+            weight = decompress_part("")
 
-            # Fuse on GPU (Fast)
-            # Output dim is 0 for Linear weights
-            weight = torch.cat([w_q, w_k, w_v], dim=0)
-
-        elif hasattr(layer, "is_split_gate_up") and layer.is_split_gate_up:
-            w_gate = decompress_part("")
-            w_up = decompress_part("")
-            weight = torch.cat([w_gate, w_up], dim=0)
+        elif hasattr(layer, "is_fused_gate_up") and layer.is_fused_gate_up:
+            # Decompress fused gate up
+            weight = decompress_part("")
 
         else:
             weight = decompress_part("")
