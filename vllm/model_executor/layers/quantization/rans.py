@@ -4,7 +4,6 @@ from typing import Any, List, Dict, Optional
 
 import torch
 from torch.nn import Parameter
-from torch.nn.Parameter import UninitializedParameter
 
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -81,244 +80,138 @@ class RansLinearMethod(LinearMethodBase):
 
     def create_weights(
         self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: List[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype,
         **extra_weight_attrs,
     ):
-        # 1. Custom Loader
-        # Handles resizing parameters when the compressed stream size is unknown at init
-        def rans_weight_loader(param: Parameter, loaded_weight: torch.Tensor):
+        # 1. Custom Loader (Handles Init vs Load size mismatch)
+        def rans_loader(param, loaded_weight):
             if param.numel() != loaded_weight.numel():
                 param.data = loaded_weight
             else:
                 param.data.copy_(loaded_weight)
 
-        # 2. Shard Definitions
-        # Defines how we split the vLLM layer back into HF components
-        if isinstance(layer, QKVParallelLinear):
-            # Qwen/Llama Attention: Fused QKV in vLLM -> Split Q, K, V in File
-            shards = ["q", "k", "v"]
-            layer.is_split_qkv = True
-            layer.is_split_gate_up = False
-        elif isinstance(layer, MergedColumnParallelLinear):
-            # Qwen/Llama MLP: Fused Gate+Up in vLLM -> Split Gate, Up in File
-            shards = ["gate", "up"]
-            layer.is_split_gate_up = True
-            layer.is_split_qkv = False
+        # 2. Universal Param Creator
+        # No 'if QKV', no 'if Merged'. Every layer gets the same single set of params.
+        # This works because your file already contains 'qkv_proj.rans_exp_stream' etc.
+        def create_param(suffix, dtype):
+            name = f"rans_{suffix}"  # No prefix!
+            param = Parameter(torch.empty(0, dtype=dtype), requires_grad=False)
+            setattr(layer, name, param)
+            setattr(param, "weight_loader", rans_loader)
+
+        # Metadata
+        create_param("info", torch.int32)
+
+        # Exponent
+        for name in [
+            "exp_stream",
+            "exp_raw",
+            "exp_states",
+            "exp_sizes",
+            "exp_freqs",
+            "exp_cdf",
+        ]:
+            # Correct dtypes map
+            dt = (
+                torch.int32
+                if "states" in name or "sizes" in name
+                else torch.int16
+                if "freqs" in name or "cdf" in name
+                else torch.bfloat16
+                if "raw" in name
+                else torch.uint8
+            )
+            create_param(name, dt)
+
+        # Mantissa
+        for name in [
+            "man_stream",
+            "man_raw",
+            "man_states",
+            "man_sizes",
+            "man_freqs",
+            "man_cdf",
+        ]:
+            dt = (
+                torch.int32
+                if "states" in name or "sizes" in name
+                else torch.int16
+                if "freqs" in name or "cdf" in name
+                else torch.uint8
+            )
+            create_param(name, dt)
+
+        # Bias
+        if extra_weight_attrs.get("bias", False):
+            layer.bias = Parameter(torch.empty(output_size, dtype=params_dtype))
+            setattr(layer.bias, "force_gpu", True)
+
+    def apply(self, layer, x, bias=None) -> torch.Tensor:
+        # 1. Check Metadata
+        info = layer.rans_info
+
+        # Fallback if layer wasn't compressed
+        if info.numel() == 0:
+            if layer.rans_exp_raw.numel() > 0:
+                weight = layer.rans_exp_raw.to(x.device, non_blocking=True)
+                return torch.nn.functional.linear(x, weight, bias)
+            raise RuntimeError(f"No RANS data found for layer {layer}")
+
+        # 2. Decompress Exponent
+        expanded_size = info[1].item()
+
+        if info[2].item() == 1:  # Is Compressed
+            stream = layer.rans_exp_stream.to(x.device, non_blocking=True)
+            raw_exp = torch.empty(expanded_size, dtype=torch.uint8, device=x.device)
+
+            # Note: Add back your 'if cached' metadata optimization here!
+
+            ccore.RansManager(stream.numel()).decompress_into(
+                stream,
+                layer.rans_exp_states.to(
+                    x.device, dtype=torch.int32, non_blocking=True
+                ),
+                layer.rans_exp_sizes.to(x.device, dtype=torch.int32, non_blocking=True),
+                info[3].item(),
+                layer.rans_exp_freqs.to(x.device, dtype=torch.int16, non_blocking=True),
+                layer.rans_exp_cdf.to(x.device, dtype=torch.int16, non_blocking=True),
+                raw_exp,
+            )
         else:
-            # Standard (O_proj, Down_proj): 1:1 match
-            shards = [""]  # Empty prefix
-            layer.is_split_qkv = False
-            layer.is_split_gate_up = False
+            raw_exp = layer.rans_exp_raw.to(x.device, non_blocking=True).flatten()
 
-        # Save shards list for apply()
-        layer.rans_shards_list = shards
+        # 3. Decompress Mantissa
+        if info[4].item() == 1:
+            stream_m = layer.rans_man_stream.to(x.device, non_blocking=True)
+            raw_man = torch.empty(expanded_size, dtype=torch.uint8, device=x.device)
 
-        # 3. Create Parameters for each Shard
-        for shard in shards:
-            # Prefix format: "q_" or ""
-            p = f"{shard}_" if shard else ""
-
-            # Helper to register
-            def reg(suffix, dtype):
-                # Name: q_rans_exp_stream
-                name = f"{p}rans_{suffix}"
-                param = Parameter(torch.empty(0, dtype=dtype), requires_grad=False)
-                setattr(layer, name, param)
-                setattr(param, "weight_loader", rans_weight_loader)
-
-            # Metadata
-            reg("info", torch.int32)
-
-            # Exponent
-            reg("exp_stream", torch.uint8)
-            reg("exp_states", torch.int32)
-            reg("exp_sizes", torch.int32)
-            reg("exp_freqs", torch.int16)
-            reg("exp_cdf", torch.int16)
-            reg("exp_raw", torch.bfloat16)
-
-            # Mantissa
-            reg("man_stream", torch.uint8)
-            reg("man_states", torch.int32)
-            reg("man_sizes", torch.int32)
-            reg("man_freqs", torch.int16)
-            reg("man_cdf", torch.int16)
-            reg("man_raw", torch.uint8)
-
-            # Bias (Split Biases)
-            if extra_weight_attrs.get("bias", False):
-                bias_name = f"{p}bias" if shard else "bias"
-                b_param = Parameter(torch.empty(0, dtype=params_dtype))
-                setattr(layer, bias_name, b_param)
-                setattr(b_param, "weight_loader", rans_weight_loader)
-                setattr(b_param, "force_gpu", True)
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """
-        Optimization: Runs ONCE on CPU after loading.
-        1. Moves static metadata (LUTs) to GPU.
-        2. Leaves huge streams on CPU (Pinned).
-        """
-        device = torch.device("cuda")
-
-        # We iterate the shards we defined in create_weights
-        for shard in layer.rans_shards_list:
-            p = f"{shard}_" if shard else ""
-
-            # Check if this shard was actually loaded/compressed
-            # We check 'info' because it's the header
-            info_param = getattr(layer, f"{p}rans_info")
-
-            if info_param.numel() > 0:
-                # --- COMPRESSED SHARD ---
-
-                # Move LUTs/States to GPU now
-                # We update the parameter data in-place to point to GPU
-                getattr(layer, f"{p}rans_exp_states").data = getattr(
-                    layer, f"{p}rans_exp_states"
-                ).to(device)
-                getattr(layer, f"{p}rans_exp_sizes").data = getattr(
-                    layer, f"{p}rans_exp_sizes"
-                ).to(device)
-                getattr(layer, f"{p}rans_exp_freqs").data = getattr(
-                    layer, f"{p}rans_exp_freqs"
-                ).to(device)
-                getattr(layer, f"{p}rans_exp_cdf").data = getattr(
-                    layer, f"{p}rans_exp_cdf"
-                ).to(device)
-
-                # Handle Mantissa Metadata
-                # (Assuming is_man_compressed is checked via info in apply, or check param size here)
-                if getattr(layer, f"{p}rans_man_stream").numel() > 0:
-                    getattr(layer, f"{p}rans_man_states").data = getattr(
-                        layer, f"{p}rans_man_states"
-                    ).to(device)
-                    getattr(layer, f"{p}rans_man_sizes").data = getattr(
-                        layer, f"{p}rans_man_sizes"
-                    ).to(device)
-                    getattr(layer, f"{p}rans_man_freqs").data = getattr(
-                        layer, f"{p}rans_man_freqs"
-                    ).to(device)
-                    getattr(layer, f"{p}rans_man_cdf").data = getattr(
-                        layer, f"{p}rans_man_cdf"
-                    ).to(device)
-                else:
-                    # Raw fallback mantissa -> GPU
-                    getattr(layer, f"{p}rans_man_raw").data = getattr(
-                        layer, f"{p}rans_man_raw"
-                    ).to(device)
-
-            else:
-                # --- RAW FALLBACK SHARD ---
-                # Move raw exponent to GPU
-                raw = getattr(layer, f"{p}rans_exp_raw")
-                if raw.numel() > 0:
-                    raw.data = raw.to(device)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        decompressed_parts = []
-        biases = []
-
-        for shard in layer.rans_shards_list:
-            p = f"{shard}_" if shard else ""
-
-            # 1. Check Info
-            info = getattr(layer, f"{p}rans_info")
-
-            if info.numel() == 0:
-                # Raw Fallback logic
-                raw = getattr(layer, f"{p}rans_exp_raw")
-                if raw.numel() == 0:
-                    # If this happens, a shard is missing.
-                    # For QKV, this is fatal. For research debugging, maybe print warning.
-                    raise RuntimeError(
-                        f"Missing weights for shard '{shard}' in layer {layer}"
-                    )
-                decompressed_parts.append(raw)  # Already on GPU from process_weights
-            else:
-                # 2. Decompress
-                expanded_size = info[1].item()
-                is_man_comp = info[4].item() == 1
-
-                # EXPONENT
-                stream = getattr(layer, f"{p}rans_exp_stream").to(
-                    x.device, non_blocking=True
-                )
-                raw_exp = torch.empty(expanded_size, dtype=torch.uint8, device=x.device)
-
-                ccore.RansManager(stream.numel()).decompress_into(
-                    stream,
-                    getattr(layer, f"{p}rans_exp_states"),  # Already on GPU
-                    getattr(layer, f"{p}rans_exp_sizes"),
-                    info[3].item(),
-                    getattr(layer, f"{p}rans_exp_freqs"),
-                    getattr(layer, f"{p}rans_exp_cdf"),
-                    raw_exp,
-                )
-
-                # MANTISSA
-                if is_man_comp:
-                    stream_m = getattr(layer, f"{p}rans_man_stream").to(
-                        x.device, non_blocking=True
-                    )
-                    raw_man = torch.empty(
-                        expanded_size, dtype=torch.uint8, device=x.device
-                    )
-                    ccore.RansManager(stream_m.numel()).decompress_into(
-                        stream_m,
-                        getattr(layer, f"{p}rans_man_states"),
-                        getattr(layer, f"{p}rans_man_sizes"),
-                        info[5].item(),
-                        getattr(layer, f"{p}rans_man_freqs"),
-                        getattr(layer, f"{p}rans_man_cdf"),
-                        raw_man,
-                    )
-                else:
-                    raw_man = getattr(layer, f"{p}rans_man_raw")  # Already on GPU
-
-                # RECONSTRUCT
-                weight = reconstruct_from_exp_and_mantissa(
-                    raw_exp, raw_man, dtype=torch.bfloat16
-                )
-
-                # RESHAPE
-                rank = info[6].item()
-                shape = torch.Size(info[7 : 7 + rank].tolist())
-                decompressed_parts.append(weight.view(shape))
-
-            # 3. Collect Bias
-            bias_name = f"{p}bias" if shard else "bias"
-            if hasattr(layer, bias_name):
-                b = getattr(layer, bias_name)
-                if b.numel() > 0:
-                    biases.append(b.to(x.device))
-
-        # --- FUSION ---
-
-        if len(decompressed_parts) == 1:
-            final_weight = decompressed_parts[0]
+            ccore.RansManager(stream_m.numel()).decompress_into(
+                stream_m,
+                layer.rans_man_states.to(
+                    x.device, dtype=torch.int32, non_blocking=True
+                ),
+                layer.rans_man_sizes.to(x.device, dtype=torch.int32, non_blocking=True),
+                info[5].item(),
+                layer.rans_man_freqs.to(x.device, dtype=torch.int16, non_blocking=True),
+                layer.rans_man_cdf.to(x.device, dtype=torch.int16, non_blocking=True),
+                raw_man,
+            )
         else:
-            # Fuse Q+K+V (dim 0)
-            final_weight = torch.cat(decompressed_tensors, dim=0)
+            raw_man = layer.rans_man_raw.to(x.device, non_blocking=True).flatten()
 
-        final_bias = None
-        if biases:
-            if len(biases) == 1:
-                final_bias = biases[0]
-            else:
-                final_bias = torch.cat(biases, dim=0)
+        # 4. Reconstruct & Reshape
+        weight = reconstruct_from_exp_and_mantissa(
+            raw_exp, raw_man, dtype=torch.bfloat16
+        )
 
-        if final_bias is None and bias is not None:
-            final_bias = bias
+        rank = info[6].item()
+        shape = torch.Size(info[7 : 7 + rank].tolist())
+        weight = weight.view(shape)  # e.g. [4096, 2048] for QKV
 
-        return torch.nn.functional.linear(x, final_weight, final_bias)
+        # 5. Compute
+        return torch.nn.functional.linear(x, weight, bias)
