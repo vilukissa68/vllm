@@ -88,18 +88,14 @@ class RansLinearMethod(LinearMethodBase):
         params_dtype,
         **extra_weight_attrs,
     ):
-        # 1. Custom Loader (Handles Init vs Load size mismatch)
-        def rans_loader(param, loaded_weight):
+        def rans_loader(param, loaded_weight, other_params=None):
             if param.numel() != loaded_weight.numel():
                 param.data = loaded_weight
             else:
                 param.data.copy_(loaded_weight)
 
-        # 2. Universal Param Creator
-        # No 'if QKV', no 'if Merged'. Every layer gets the same single set of params.
-        # This works because your file already contains 'qkv_proj.rans_exp_stream' etc.
         def create_param(suffix, dtype):
-            name = f"rans_{suffix}"  # No prefix!
+            name = f"rans_{suffix}"
             param = Parameter(torch.empty(0, dtype=dtype), requires_grad=False)
             setattr(layer, name, param)
             setattr(param, "weight_loader", rans_loader)
@@ -108,43 +104,26 @@ class RansLinearMethod(LinearMethodBase):
         create_param("info", torch.int32)
 
         # Exponent
-        for name in [
-            "exp_stream",
-            "exp_raw",
-            "exp_states",
-            "exp_sizes",
-            "exp_freqs",
-            "exp_cdf",
-        ]:
-            # Correct dtypes map
-            dt = (
-                torch.int32
-                if "states" in name or "sizes" in name
-                else torch.int16
-                if "freqs" in name or "cdf" in name
-                else torch.bfloat16
-                if "raw" in name
-                else torch.uint8
-            )
-            create_param(name, dt)
+        for name, dtype in {
+            "exp_stream": torch.uint8,
+            "exp_raw": torch.uint8,
+            "exp_states": torch.int32,
+            "exp_sizes": torch.int32,
+            "exp_tables": torch.uint32,
+            "exp_slot_map": torch.uint16,
+        }.items():
+            create_param(name, dtype)
 
         # Mantissa
-        for name in [
-            "man_stream",
-            "man_raw",
-            "man_states",
-            "man_sizes",
-            "man_freqs",
-            "man_cdf",
-        ]:
-            dt = (
-                torch.int32
-                if "states" in name or "sizes" in name
-                else torch.int16
-                if "freqs" in name or "cdf" in name
-                else torch.uint8
-            )
-            create_param(name, dt)
+        for name, dtype in {
+            "man_stream": torch.uint8,
+            "man_raw": torch.uint8,
+            "man_states": torch.int32,
+            "man_sizes": torch.int32,
+            "man_tables": torch.uint32,
+            "man_slot_map": torch.uint16,
+        }.items():
+            create_param(name, dtype)
 
         # Bias
         if extra_weight_attrs.get("bias", False):
@@ -152,7 +131,7 @@ class RansLinearMethod(LinearMethodBase):
             setattr(layer.bias, "force_gpu", True)
 
     def apply(self, layer, x, bias=None) -> torch.Tensor:
-        # 1. Check Metadata
+        # Check Metadata
         info = layer.rans_info
 
         # Fallback if layer wasn't compressed
@@ -162,56 +141,70 @@ class RansLinearMethod(LinearMethodBase):
                 return torch.nn.functional.linear(x, weight, bias)
             raise RuntimeError(f"No RANS data found for layer {layer}")
 
-        # 2. Decompress Exponent
+        # Decompress Exponent
         expanded_size = info[1].item()
 
         if info[2].item() == 1:  # Is Compressed
-            stream = layer.rans_exp_stream.to(x.device, non_blocking=True)
+            stream = layer.rans_exp_stream.to(
+                x.device, dtype=torch.uint8, non_blocking=True
+            )
+            exp_states = layer.rans_exp_states.to(
+                x.device, dtype=torch.int32, non_blocking=True
+            )
+            exp_sizes = layer.rans_exp_sizes.to(
+                x.device, dtype=torch.int32, non_blocking=True
+            )
+            num_streams = info[3].item()
+            exp_tables = layer.rans_exp_tables.to(
+                x.device, dtype=torch.uint32, non_blocking=True
+            )
+            exp_slot_map = layer.rans_exp_slot_map.to(
+                x.device, dtype=torch.uint8, non_blocking=True
+            )
             raw_exp = torch.empty(expanded_size, dtype=torch.uint8, device=x.device)
 
-            # Note: Add back your 'if cached' metadata optimization here!
-
-            ccore.RansManager(stream.numel()).decompress_into(
+            ccore.decompress(
                 stream,
-                layer.rans_exp_states.to(
-                    x.device, dtype=torch.int32, non_blocking=True
-                ),
-                layer.rans_exp_sizes.to(x.device, dtype=torch.int32, non_blocking=True),
-                info[3].item(),
-                layer.rans_exp_freqs.to(x.device, dtype=torch.int16, non_blocking=True),
-                layer.rans_exp_cdf.to(x.device, dtype=torch.int16, non_blocking=True),
+                exp_states,
+                exp_sizes,
+                num_streams,
+                exp_tables,
+                exp_slot_map,
                 raw_exp,
             )
         else:
             raw_exp = layer.rans_exp_raw.to(x.device, non_blocking=True).flatten()
 
-        # 3. Decompress Mantissa
+        # Decompress Mantissa
         if info[4].item() == 1:
             stream_m = layer.rans_man_stream.to(x.device, non_blocking=True)
             raw_man = torch.empty(expanded_size, dtype=torch.uint8, device=x.device)
 
-            ccore.RansManager(stream_m.numel()).decompress_into(
+            ccore.decompress(
                 stream_m,
                 layer.rans_man_states.to(
                     x.device, dtype=torch.int32, non_blocking=True
                 ),
                 layer.rans_man_sizes.to(x.device, dtype=torch.int32, non_blocking=True),
                 info[5].item(),
-                layer.rans_man_freqs.to(x.device, dtype=torch.int16, non_blocking=True),
-                layer.rans_man_cdf.to(x.device, dtype=torch.int16, non_blocking=True),
+                layer.rans_man_tables.to(
+                    x.device, dtype=torch.uint32, non_blocking=True
+                ),
+                layer.rans_man_slot_map.to(
+                    x.device, dtype=torch.uint16, non_blocking=True
+                ),
                 raw_man,
             )
         else:
             raw_man = layer.rans_man_raw.to(x.device, non_blocking=True).flatten()
 
-        # 4. Reconstruct & Reshape
+        # Reconstruct & Reshape
         weight = reconstruct_from_exp_and_mantissa(
             raw_exp, raw_man, dtype=torch.bfloat16
         )
 
         rank = info[6].item()
         shape = torch.Size(info[7 : 7 + rank].tolist())
-        weight = weight.view(shape)  # e.g. [4096, 2048] for QKV
-
-        # 5. Compute
+        weight = weight.view(shape)
+        # Matmul
         return torch.nn.functional.linear(x, weight, bias)
