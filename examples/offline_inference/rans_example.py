@@ -25,19 +25,34 @@ def main():
 
     # 1. Initialize the Engine
     # This triggers your RansLinearMethod.create_weights logic
-    llm = LLM(
-        model=args.model_path,
-        tokenizer="Qwen/Qwen3-0.6B",
-        quantization="rans" if args.quant else None,  # <--- Triggers your backend
-        dtype="bfloat16",  # Match your compression dtype
-        enforce_eager=True,  # CRITICAL: Disable CUDA Graphs for dynamic loading
-        trust_remote_code=True,
-        gpu_memory_utilization=0.90,
-        tensor_parallel_size=1,  # Change if you have multi-gpu
-    )
+    if args.quant:
+        llm = LLM(
+            model=args.model_path,
+            tokenizer="Qwen/Qwen3-0.6B",
+            quantization="rans",  # <--- Triggers your backend
+            dtype="bfloat16",  # Match your compression dtype
+            enforce_eager=True,  # CRITICAL: Disable CUDA Graphs for dynamic loading
+            trust_remote_code=True,
+            # gpu_memory_utilization=0.04,  # Only 10% of VRAM is "available"
+            # cpu_offload_gb=10,
+            # max_model_len=512,
+            tensor_parallel_size=1,  # Change if you have multi-gpu
+        )
+    else:
+        llm = LLM(
+            model=args.model_path,
+            tokenizer="Qwen/Qwen3-0.6B",
+            dtype="bfloat16",  # Match your compression dtype
+            enforce_eager=True,  # CRITICAL: Disable CUDA Graphs for dynamic loading
+            trust_remote_code=True,
+            gpu_memory_utilization=0.04,  # Only 10% of VRAM is "available"
+            cpu_offload_gb=10,
+            max_model_len=512,
+            tensor_parallel_size=1,  # Change if you have multi-gpu
+        )
 
     # 2. Define Sampling
-    sampling_params = SamplingParams(temperature=args.temp, max_tokens=args.max_tokens)
+    sampling_params = SamplingParams(max_tokens=args.max_tokens)
 
     # 3. Generate
     print(f"--- Generating ---")

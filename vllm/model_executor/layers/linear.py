@@ -334,7 +334,6 @@ class ReplicatedLinear(LinearBase):
         return_bias: bool = True,
         disable_tp: bool = False,
     ):
-        print("ReplicateLinear init")
         # If MergedReplicatedLinear, use output size of each partition.
         if hasattr(self, "output_sizes"):
             self.output_partition_sizes = self.output_sizes
@@ -464,7 +463,6 @@ class ColumnParallelLinear(LinearBase):
         return_bias: bool = True,
         disable_tp: bool = False,
     ):
-        print("ColumnParallelLinear init")
         # Divide the weight matrix along the last dimension.
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
@@ -599,7 +597,6 @@ class ColumnParallelLinear(LinearBase):
         self,
         input_,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        print("ColumnParallelLinear forward")
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
@@ -953,7 +950,6 @@ class QKVParallelLinear(ColumnParallelLinear):
         disable_tp: bool = False,
         v_head_size: int | None = None,
     ):
-        print("QKVParallelLinear init")
         self.hidden_size = hidden_size
         self.head_size = head_size
         self.v_head_size = v_head_size if v_head_size is not None else head_size
@@ -1342,7 +1338,6 @@ class RowParallelLinear(LinearBase):
         return_bias: bool = True,
         disable_tp: bool = False,
     ):
-        print("RowParallelLinear init")
         # Divide the weight matrix along the first dimension.
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
@@ -1453,7 +1448,6 @@ class RowParallelLinear(LinearBase):
             )
             input_parallel = splitted_input[self.tp_rank].contiguous()
 
-        print("Forward called in RowParallelLinear")
         # Matrix multiply.
         assert self.quant_method is not None
         # Only fuse bias add into GEMM for rank 0 (this ensures that
