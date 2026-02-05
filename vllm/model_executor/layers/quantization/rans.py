@@ -34,7 +34,12 @@ from vllm.model_executor.layers.linear import (
 
 
 try:
-    from comp_inference import ccore, reconstruct_from_exp_and_mantissa
+    from comp_inference import (
+        ccore,
+        reconstruct_from_exp_and_mantissa,
+        fused_rans_linear_triton,
+        rans_decomp_triton,
+    )
 
     print("SUCCESS: comp_inference loaded.")
 except Exception as e:
@@ -79,15 +84,28 @@ class RansConfig(QuantizationConfig):
 
 def register_rans_parameters(layer: torch.nn.Module):
     def rans_loader(param, loaded_weight, other=None):
-        if param.numel() != loaded_weight.numel():
-            param.data = loaded_weight.to(param.device)
+        # 1. Determine the target device (assigned by vLLM)
+        target_device = param.device
+
+        # 2. Move loaded_weight to the target device
+        # If target_device is CPU, we MUST call .pin_memory()
+        if target_device.type == "cpu":
+            # Pinning is required so the GPU can read this CPU memory directly
+            final_weight = loaded_weight.to(target_device).pin_memory()
         else:
-            param.data.copy_(loaded_weight)
+            final_weight = loaded_weight.to(target_device)
+
+        # 3. Handle the 'empty(0)' initialization
+        # If the parameter hasn't been allocated yet or size changed
+        if param.numel() != final_weight.numel():
+            # Re-assigning .data is safe here during the loading phase
+            param.data = final_weight
+        else:
+            param.data.copy_(final_weight)
 
         param_name = getattr(param, "rans_name", "")
-        print("Param name:", param_name)
         if "info" in param_name:  # or check by shape/type
-            info_list = loaded_weight.tolist()
+            info_list = loaded_weight.cpu().tolist()
             layer.rans_expanded_size = info_list[1]
             layer.rans_exp_compressed = bool(info_list[2])
             layer.rans_exp_num_streams = info_list[3]
@@ -99,11 +117,12 @@ def register_rans_parameters(layer: torch.nn.Module):
     def create_param(suffix, dtype):
         name = f"rans_{suffix}"
 
-        param = torch.nn.Parameter(torch.empty(0, dtype=dtype), requires_grad=False)
+        pinned_data = torch.empty(0, dtype=dtype, device="cpu").pin_memory()
+        param = torch.nn.Parameter(pinned_data, requires_grad=False)
         param.rans_name = name
 
         # Tell vLLM to move param to GPU and keep it there
-        setattr(param, "force_gpu", True)
+        # setattr(param, "force_gpu", True)
         setattr(param, "weight_loader", rans_loader)
         setattr(layer, name, param)
 
@@ -154,7 +173,7 @@ class RansLinearMethod(LinearMethodBase):
         # Bias
         if extra_weight_attrs.get("bias", False):
             layer.bias = Parameter(torch.empty(output_size, dtype=params_dtype))
-            setattr(layer.bias, "force_gpu", True)
+            # setattr(layer.bias, "force_gpu", True)
 
     def apply(self, layer, x, bias=None) -> torch.Tensor:
         info = layer.rans_info
@@ -167,24 +186,53 @@ class RansLinearMethod(LinearMethodBase):
         # Decompress Exponent
         expanded_size = layer.rans_expanded_size
 
-        if layer.rans_exp_compressed:  # Is Compressed
-            stream = layer.rans_exp_stream
-            exp_states = layer.rans_exp_states
-            exp_sizes = layer.rans_exp_sizes
-            num_streams = layer.rans_exp_num_streams
-            exp_tables = layer.rans_exp_tables
-            exp_slot_map = layer.rans_exp_slot_map
-            raw_exp = torch.empty(expanded_size, dtype=torch.uint8, device=x.device)
-
-            ccore.decompress(
-                stream,
-                exp_states,
-                exp_sizes,
-                num_streams,
-                exp_tables,
-                exp_slot_map,
-                raw_exp,
+        # Triton fused decomp matmul
+        if True:
+            N, K = layer.rans_shape[-2], layer.rans_shape[-1]
+            M = x.view(-1, K).shape[0]
+            out_shape = list(x.shape[:-1]) + [N]
+            return fused_rans_linear_triton(
+                x=x,
+                exp_stream=layer.rans_exp_stream,
+                man_stream=layer.rans_man_raw,
+                exp_states=layer.rans_exp_states,
+                exp_tables=layer.rans_exp_tables,
+                exp_slot_map=layer.rans_exp_slot_map,
+                exp_sizes=layer.rans_exp_sizes,
+                bias=bias,
+                weight_shape=layer.rans_shape,
+                output_shape=out_shape,
             )
+
+        if layer.rans_exp_compressed:  # Is Compressed
+            stream = layer.rans_exp_stream.to(x.device)
+            exp_states = layer.rans_exp_states.to(x.device)
+            exp_sizes = layer.rans_exp_sizes.to(x.device)
+            num_streams = layer.rans_exp_num_streams
+            exp_tables = layer.rans_exp_tables.to(x.device)
+            exp_slot_map = layer.rans_exp_slot_map.to(x.device)
+            # raw_exp = torch.empty(expanded_size, dtype=torch.uint8, device=x.device)
+
+            # ccore.decompress(
+            #     stream,
+            #     exp_states,
+            #     exp_sizes,
+            #     num_streams,
+            #     exp_tables,
+            #     exp_slot_map,
+            #     raw_exp,
+            # )
+            N, K = layer.rans_shape[-2], layer.rans_shape[-1]
+            out_shape = list(x.shape[:-1]) + [N]
+            raw_exp = rans_decomp_triton(
+                compressed_streams=stream,
+                initial_states=exp_states,
+                tables=exp_tables,
+                slot_map=exp_slot_map,
+                stream_sizes=exp_sizes,
+                output_shape=layer.rans_shape,
+            ).flatten()
+
         else:
             raw_exp = layer.rans_exp_raw.flatten()
 
@@ -202,7 +250,7 @@ class RansLinearMethod(LinearMethodBase):
                 raw_man,
             )
         else:
-            raw_man = layer.rans_man_raw.flatten()
+            raw_man = layer.rans_man_raw.flatten().to(x.device)
 
         # Reconstruct & Reshape
         weight = reconstruct_from_exp_and_mantissa(
@@ -235,9 +283,10 @@ class RansEmbeddingMethod(RansLinearMethod):
         # Bias
         if extra_weight_attrs.get("bias", False):
             layer.bias = Parameter(torch.empty(output_size, dtype=params_dtype))
-            setattr(layer.bias, "force_gpu", True)
+            # setattr(layer.bias, "force_gpu", True)
 
     def embedding(self, layer, x, bias=None) -> torch.Tensor:
+        print("Embedding called")
         info = layer.rans_info
         if info.numel() == 0:
             if layer.rans_exp_raw.numel() > 0:
@@ -249,23 +298,33 @@ class RansEmbeddingMethod(RansLinearMethod):
         expanded_size = layer.rans_expanded_size
 
         if layer.rans_exp_compressed:
-            stream = layer.rans_exp_stream
-            exp_states = layer.rans_exp_states
-            exp_sizes = layer.rans_exp_sizes
+            stream = layer.rans_exp_stream.to(x.device)
+            exp_states = layer.rans_exp_states.to(x.device)
+            exp_sizes = layer.rans_exp_sizes.to(x.device)
             num_streams = layer.rans_exp_num_streams
-            exp_tables = layer.rans_exp_tables
-            exp_slot_map = layer.rans_exp_slot_map
-            raw_exp = torch.empty(expanded_size, dtype=torch.uint8, device=x.device)
+            exp_tables = layer.rans_exp_tables.to(x.device)
+            exp_slot_map = layer.rans_exp_slot_map.to(x.device)
+            # raw_exp = torch.empty(expanded_size, dtype=torch.uint8, device=x.device)
 
-            ccore.decompress(
-                stream,
-                exp_states,
-                exp_sizes,
-                num_streams,
-                exp_tables,
-                exp_slot_map,
-                raw_exp,
-            )
+            # ccore.decompress(
+            #     stream,
+            #     exp_states,
+            #     exp_sizes,
+            #     num_streams,
+            #     exp_tables,
+            #     exp_slot_map,
+            #     raw_exp,
+            # )
+            N, K = layer.rans_shape[-2], layer.rans_shape[-1]
+            out_shape = list(x.shape[:-1]) + [N]
+            raw_exp = rans_decomp_triton(
+                compressed_streams=stream,
+                initial_states=exp_states,
+                tables=exp_tables,
+                slot_map=exp_slot_map,
+                stream_sizes=exp_sizes,
+                output_shape=layer.rans_shape,
+            ).flatten()
         else:
             raw_exp = layer.rans_exp_raw.flatten()
 
@@ -284,7 +343,7 @@ class RansEmbeddingMethod(RansLinearMethod):
                 raw_man,
             )
         else:
-            raw_man = layer.rans_man_raw.flatten()
+            raw_man = layer.rans_man_raw.flatten().to(x.device)
 
         # Reconstruct & Reshape
         weight = reconstruct_from_exp_and_mantissa(
@@ -294,5 +353,4 @@ class RansEmbeddingMethod(RansLinearMethod):
         shape = layer.rans_shape
         weight = weight.view(shape)
         # Matmul
-        print("Embedding input types:", "x:", x.dtype, "weight:", weight.dtype)
         return torch.nn.functional.embedding(x.to(torch.int32), weight, bias)
