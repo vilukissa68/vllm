@@ -28,13 +28,13 @@ def main():
     if args.quant:
         llm = LLM(
             model=args.model_path,
-            tokenizer="Qwen/Qwen3-0.6B",
+            tokenizer="Qwen/Qwen3-14B",
             quantization="rans",  # <--- Triggers your backend
             dtype="bfloat16",  # Match your compression dtype
             enforce_eager=True,  # CRITICAL: Disable CUDA Graphs for dynamic loading
             trust_remote_code=True,
             # gpu_memory_utilization=0.04,  # Only 10% of VRAM is "available"
-            gpu_memory_utilization=0.5,  # Use more VRAM for quantized models
+            gpu_memory_utilization=0.7,  # Use more VRAM for quantized models
             # cpu_offload_gb=10,
             # max_model_len=512,
             tensor_parallel_size=1,  # Change if you have multi-gpu
@@ -42,13 +42,14 @@ def main():
     else:
         llm = LLM(
             model=args.model_path,
-            tokenizer="Qwen/Qwen3-0.6B",
+            tokenizer="Qwen/Qwen3-14B",  # Use the same path for tokenizer if not quantized
             dtype="bfloat16",  # Match your compression dtype
             enforce_eager=True,  # CRITICAL: Disable CUDA Graphs for dynamic loading
             trust_remote_code=True,
-            gpu_memory_utilization=0.04,  # Only 10% of VRAM is "available"
-            cpu_offload_gb=10,
-            max_model_len=512,
+            # gpu_memory_utilization=0.04,  # Only 10% of VRAM is "available"
+            gpu_memory_utilization=0.7,  # Use more VRAM for quantized models
+            # cpu_offload_gb=10,
+            # max_model_len=512,
             tensor_parallel_size=1,  # Change if you have multi-gpu
         )
 
