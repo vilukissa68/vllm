@@ -1,40 +1,84 @@
 #!/usr/bin/env python3
-
-import argparse
-import multiprocessing as mp
-import time
 import os
-
-import pynvml
-import threading
+import sys
+import argparse
 import time
+import json
+import gc
+import threading
+import torch
+import numpy as np
+import multiprocessing
+from datetime import datetime
+from typing import Dict, Any, List
+
+# Try importing pynvml for power monitoring
+try:
+    import pynvml
+
+    PYNVML_AVAILABLE = True
+except ImportError:
+    PYNVML_AVAILABLE = False
 
 
+# --- HELPER: DYNAMIC MODEL SIZE ---
+def get_dynamic_model_size(model_path: str) -> int:
+    total_bytes = 0
+    if os.path.exists(model_path):
+        for root, _, files in os.walk(model_path):
+            for file in files:
+                if file.endswith(".safetensors") or file.endswith(".bin"):
+                    total_bytes += os.path.getsize(os.path.join(root, file))
+    else:
+        try:
+            from huggingface_hub import model_info
+
+            info = model_info(model_path, files_metadata=True)
+            for sibling in info.siblings:
+                if (
+                    sibling.rfilename.endswith(".safetensors")
+                    or sibling.rfilename.endswith(".bin")
+                ) and sibling.size is not None:
+                    total_bytes += sibling.size
+        except Exception as e:
+            print(f"[Warn] Could not determine size for {model_path}: {e}")
+            return 0
+    return total_bytes
+
+
+# --- HELPER: POWER MONITOR ---
 class PowerMonitor:
-    def __init__(self, gpu_id=0, interval=0.01):
-        """
-        Monitors GPU power consumption in a background thread.
-        interval: Time in seconds between power samples (default 10ms).
-        """
-        pynvml.nvmlInit()
-        self.handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+    def __init__(self, gpu_id=0, interval=0.1):
         self.interval = interval
         self.is_recording = False
-        self.power_readings = []  # Stores Watts
+        self.power_readings = []
         self.thread = None
+        self.gpu_id = gpu_id
+        self.available = False
+
+        if PYNVML_AVAILABLE:
+            try:
+                pynvml.nvmlInit()
+                self.handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+                self.available = True
+            except Exception:
+                pass
 
     def _record(self):
-        while self.is_recording:
-            # NVML returns power in milliwatts
-            power_mw = pynvml.nvmlDeviceGetPowerUsage(self.handle)
-            self.power_readings.append(power_mw / 1000.0)
+        while self.is_recording and self.available:
+            try:
+                power_mw = pynvml.nvmlDeviceGetPowerUsage(self.handle)
+                self.power_readings.append(power_mw / 1000.0)
+            except:
+                pass
             time.sleep(self.interval)
 
     def start(self):
         self.power_readings = []
         self.is_recording = True
-        self.thread = threading.Thread(target=self._record)
-        self.thread.start()
+        if self.available:
+            self.thread = threading.Thread(target=self._record)
+            self.thread.start()
 
     def stop(self):
         self.is_recording = False
@@ -45,230 +89,338 @@ class PowerMonitor:
             return 0.0, 0.0
 
         avg_power = sum(self.power_readings) / len(self.power_readings)
-        # Energy (Joules) = Power (Watts) * Time (Seconds)
         total_energy_joules = sum(p * self.interval for p in self.power_readings)
-
         return avg_power, total_energy_joules
 
 
-def run_engine(mode, model_path, args, result_dict):
+# --- WORKER FUNCTION ---
+def benchmark_worker(
+    gpu_id: int,
+    task_queue: multiprocessing.Queue,
+    result_queue: multiprocessing.Queue,
+    args_dict: Dict,
+    model_meta: Dict,
+):
     """
-    Runs the vLLM engine inside an isolated process to ensure perfect
-    VRAM cleanup between the baseline and compressed runs.
+    Worker process that owns a specific GPU and processes benchmark tasks.
     """
-    # Force the isolated process to respect the GPU targeting
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
-    # Import vLLM ONLY inside the subprocess so it initializes cleanly
+    # Import vLLM here to avoid CUDA context issues in parent
+    import vllm
     from vllm import LLM, SamplingParams
-    import torch
 
-    num_gpus = len(args.gpus.split(","))
-
-    # 1. Get the actual physical memory of the target GPU (e.g., 48GB for A6000)
-    total_gpu_vram = torch.cuda.get_device_properties(0).total_memory
-    total_allowed_vram = total_gpu_vram * args.vram_util
-    weight_budget_bytes = int(total_allowed_vram * 0.80)
-
-    # 4. Broadcast the budget to your custom backend
-    os.environ["RANS_WEIGHT_BUDGET_BYTES"] = str(weight_budget_bytes)
-    print(f"\n{'='*60}")
-    print(f"🚀 STARTING {mode.upper()} BENCHMARK")
-    print(f"Model: {model_path}")
-    print(f"VRAM Budget: {args.vram_util * 100:.1f}%")
-    if mode == "baseline":
-        print(f"CPU Offload Pool: {args.cpu_offload} GB")
-    print(f"{'='*60}")
-
-    # 1. Initialize Engine
-    if mode == "rans":
-        llm = LLM(
-            model=model_path,
-            quantization="rans",
-            dtype="bfloat16",
-            enforce_eager=True,  # Critical: Disable CUDA graphs
-            trust_remote_code=True,
-            gpu_memory_utilization=args.vram_util,
-            # cpu_offload_gb=args.cpu_offload,
-            max_model_len=args.max_len,
-            tensor_parallel_size=num_gpus,
-        )
+    # Re-init CUDA for this process
+    if torch.cuda.is_available():
+        torch.cuda.init()
+        total_vram_bytes = torch.cuda.get_device_properties(0).total_memory
     else:
-        llm = LLM(
-            model=model_path,  # Load from huggingface for baseline to ensure no compression
-            dtype="bfloat16",
-            enforce_eager=True,  # Disabled to maintain fairness
-            trust_remote_code=True,
-            gpu_memory_utilization=args.vram_util,
-            cpu_offload_gb=args.cpu_offload,
-            max_model_len=args.max_len,
-            tensor_parallel_size=num_gpus,
-        )
+        total_vram_bytes = 0
 
-    sampling_params = SamplingParams(max_tokens=args.max_tokens, temperature=0.0)
+    power_monitor = PowerMonitor(gpu_id=0)  # It sees itself as device 0 now
 
-    # 2. Warm-up Phase
-    print("\n[Running Warmup...]")
-    for _ in range(args.warmup_runs):
-        llm.generate(
-            ["Hello world, please reply."],
-            SamplingParams(max_tokens=10),
-            use_tqdm=False,
-        )
+    while True:
+        task = task_queue.get()
+        if task is None:  # Sentinel
+            break
 
-    # --- VERIFICATION SNAPSHOT ---
-    torch.cuda.synchronize()
-    vram_used_gb = torch.cuda.memory_allocated(0) / (1024**3)
-    vram_reserved_gb = torch.cuda.memory_reserved(0) / (1024**3)
-    print(f"\n[VRAM VERIFICATION]")
-    print(f"  Allocated (Weights + KV Cache active): {vram_used_gb:.2f} GB")
-    print(f"  Reserved (vLLM total claim):           {vram_reserved_gb:.2f} GB")
-    # -----------------------------
+        mode, vram_util = task
+        print(f"[GPU {gpu_id}] Starting task: {mode} @ {vram_util*100:.0f}% VRAM")
 
-    # 3. Evaluation Phase
-    print(f"\n[Evaluating for {args.eval_runs} runs...]")
-    total_decode_toks_per_sec = 0.0
-    final_text = ""
+        # --- CONFIGURE BUDGET & OFFLOAD ---
+        target_gpu_bytes = int(total_vram_bytes * vram_util)
 
-    power_monitor = PowerMonitor(gpu_id=0, interval=0.01)
+        # Reserve strict amount for KV cache and PyTorch overhead
+        KV_RESERVE_BYTES = int(args_dict["kv_cache"] * (1024**3))
+        allowed_weight_budget = max(0, target_gpu_bytes - KV_RESERVE_BYTES)
 
-    total_avg_power = 0.0
-    total_energy = 0.0
-    total_tokens_generated = 0
+        if "rans" in mode:
+            os.environ["USE_RANS_JIT"] = "1" if "unfused" in mode else "0"
+            os.environ["RANS_WEIGHT_BUDGET_BYTES"] = str(allowed_weight_budget)
+            model_path = args_dict["compressed_model"]
+            model_bytes = model_meta["rans_bytes"]
+        else:  # Baseline
+            model_path = args_dict["baseline_model"]
+            model_bytes = model_meta["base_bytes"]
 
-    for i in range(args.eval_runs):
-        power_monitor.start()
+        # Calculate exactly how much spills over to CPU
+        offload_bytes = max(0, model_bytes - allowed_weight_budget)
+        cpu_offload_gb = offload_bytes / (1024**3)
 
-        start_time = time.perf_counter()
-        outputs = llm.generate([args.prompt], sampling_params, use_tqdm=False)
-        end_time = time.perf_counter()
+        # Clean slate
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.empty_cache()
+            gc.collect()
 
-        avg_power, energy_joules = power_monitor.stop()
+        # --- INITIALIZE ENGINE ---
+        try:
+            llm = LLM(
+                model=model_path,
+                quantization="rans" if "rans" in mode else None,
+                dtype="bfloat16",
+                enforce_eager=True,
+                trust_remote_code=True,
+                gpu_memory_utilization=vram_util,
+                cpu_offload_gb=cpu_offload_gb,
+                max_model_len=max(args_dict["prompt_lens"])
+                + max(args_dict["gen_lens"])
+                + 128,
+                tensor_parallel_size=1,  # Always 1 per worker in this parallel scheme
+                disable_log_stats=True,
+            )
 
-        output = outputs[0]
-        final_text = output.outputs[0].text
-        generated_tokens = len(output.outputs[0].token_ids)
-        total_tokens_generated += generated_tokens
+            # Extract Cache Stats (Tokens & GB)
+            try:
+                cache_config = llm.llm_engine.cache_config
+                kv_cache_tokens = cache_config.num_gpu_blocks * cache_config.block_size
 
-        metrics = output.metrics
-        if metrics is not None and metrics.first_token_time is not None:
-            decode_time = metrics.finished_time - metrics.first_token_time
-        else:
-            decode_time = end_time - start_time
+                # Calculate GB using Model Config
+                hf_config = llm.llm_engine.model_config.hf_config
+                num_layers = getattr(
+                    hf_config, "num_hidden_layers", getattr(hf_config, "n_layer", 0)
+                )
+                num_kv_heads = getattr(
+                    hf_config,
+                    "num_key_value_heads",
+                    getattr(hf_config, "num_attention_heads", 1),
+                )
 
-        decode_toks_sec = generated_tokens / decode_time if decode_time > 0 else 0
-        total_decode_toks_per_sec += decode_toks_sec
-        total_avg_power += avg_power
-        total_energy += energy_joules
+                if hasattr(hf_config, "head_dim"):
+                    head_dim = hf_config.head_dim
+                else:
+                    head_dim = hf_config.hidden_size // getattr(
+                        hf_config, "num_attention_heads", 1
+                    )
 
-        print(
-            f"  Run {i+1}: {decode_toks_sec:.2f} tokens/s | Power: {avg_power:.1f} W | Energy: {energy_joules:.1f} Joules"
-        )
+                # 2 (K+V) * 2 bytes (bf16) = 4 bytes per parameter
+                bytes_per_token = 4 * num_layers * num_kv_heads * head_dim
+                kv_cache_gb = (kv_cache_tokens * bytes_per_token) / (1024**3)
 
-    avg_toks_sec = total_decode_toks_per_sec / args.eval_runs
-    avg_power_overall = total_avg_power / args.eval_runs
-    energy_per_token = (
-        total_energy / total_tokens_generated if total_tokens_generated > 0 else 0
-    )
+            except Exception as e:
+                print(f"[Warn] Could not calculate KV Cache specs: {e}")
+                kv_cache_tokens = 0
+                kv_cache_gb = 0.0
 
-    # Save results to the shared dictionary
-    result_dict["avg_toks_sec"] = avg_toks_sec
-    result_dict["avg_power"] = avg_power_overall
-    result_dict["energy_per_token"] = energy_per_token
-    result_dict["vram_used_gb"] = vram_used_gb
-    result_dict["vram_reserved_gb"] = vram_reserved_gb
+            # --- RUN SWEEPS ---
+            for bs in args_dict["batch_sizes"]:
+                for pl in args_dict["prompt_lens"]:
+                    for gl in args_dict["gen_lens"]:
+                        req_tokens = bs * (pl + gl)
+                        if kv_cache_tokens > 0 and req_tokens > kv_cache_tokens:
+                            continue
 
-    print(f"\n✅ {mode.upper()} AVERAGE: {avg_toks_sec:.2f} tokens/s")
-    print(f"   Average Power: {avg_power_overall:.1f} W")
-    print(f"   Energy per Token: {energy_per_token:.2f} Joules/token")
+                        prompts = [{"prompt_token_ids": [100] * pl} for _ in range(bs)]
+                        sp = SamplingParams(
+                            max_tokens=gl, temperature=0.0, ignore_eos=True
+                        )
 
-    # Aggressive teardown (though the process dying will handle most of this)
-    del llm
-    torch.cuda.empty_cache()
+                        # Warmup
+                        try:
+                            llm.generate(
+                                prompts=[{"prompt_token_ids": [100] * 10}],
+                                sampling_params=SamplingParams(max_tokens=2),
+                                use_tqdm=False,
+                            )
+                        except:
+                            pass
+
+                        latencies = []
+                        powers = []
+                        energies = []
+
+                        torch.cuda.reset_peak_memory_stats()
+
+                        try:
+                            for _ in range(args_dict["eval_runs"]):
+                                power_monitor.start()
+                                t0 = time.perf_counter()
+                                req_outputs = llm.generate(
+                                    prompts=prompts, sampling_params=sp, use_tqdm=False
+                                )
+                                t1 = time.perf_counter()
+                                p_avg, e_total = power_monitor.stop()
+
+                                gen_tokens = sum(
+                                    len(o.outputs[0].token_ids) for o in req_outputs
+                                )
+                                if gen_tokens > 0:
+                                    latencies.append(gen_tokens / (t1 - t0))
+                                powers.append(p_avg)
+                                energies.append(e_total)
+
+                            peak_allocated = torch.cuda.max_memory_allocated()
+                            peak_reserved = torch.cuda.max_memory_reserved()
+
+                            result_record = {
+                                "mode": mode,
+                                "vram_util_config": vram_util,
+                                "total_vram_gb": total_vram_bytes / 1e9,
+                                "batch_size": bs,
+                                "prompt_len": pl,
+                                "gen_len": gl,
+                                "kv_cache_tokens": kv_cache_tokens,
+                                "kv_cache_gb": kv_cache_gb,
+                                "cpu_offload_gb": cpu_offload_gb,
+                                "avg_toks_sec": float(np.mean(latencies))
+                                if latencies
+                                else 0.0,
+                                "avg_power_w": float(np.mean(powers))
+                                if powers
+                                else 0.0,
+                                "energy_j": float(np.mean(energies))
+                                if energies
+                                else 0.0,
+                                "peak_allocated_gb": peak_allocated / (1024**3),
+                                "peak_reserved_gb": peak_reserved / (1024**3),
+                            }
+
+                            result_queue.put(result_record)
+
+                        except Exception as e:
+                            print(f"[GPU {gpu_id}] Run Failed: {e}")
+                            torch.cuda.empty_cache()
+
+            del llm
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            try:
+                from vllm.distributed.parallel_state import (
+                    destroy_model_parallel,
+                    destroy_distributed_environment,
+                )
+
+                destroy_model_parallel()
+                destroy_distributed_environment()
+            except:
+                pass
+
+        except Exception as e:
+            print(f"[GPU {gpu_id}] Engine Init Failed for {mode}: {e}")
+
+    print(f"[GPU {gpu_id}] Worker Finished.")
 
 
+# --- MAIN ---
 def main():
-    parser = argparse.ArgumentParser(
-        description="rANS vs Baseline CPU Offload Benchmark"
-    )
+    multiprocessing.set_start_method("spawn", force=True)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--baseline_model", type=str, default="Qwen/Qwen3-14B")
+    parser.add_argument("--compressed_model", type=str, required=True)
+    parser.add_argument("--gpus", type=str, default="0")
+
+    # --- NEW: MODES TOGGLE ---
     parser.add_argument(
-        "--baseline_model",
+        "--modes",
         type=str,
-        default="Qwen/Qwen3-14B",
-        help="Path/Hub ID for the baseline model",
+        default="rans_fused,baseline,rans_unfused",
+        help="Comma-separated modes to run",
     )
+
     parser.add_argument(
-        "--compressed_model",
-        type=str,
-        required=True,
-        help="Path to the rANS compressed model folder",
+        "--vram_utils", type=str, default="0.9", help="Comma list: 0.8,0.9"
     )
+    parser.add_argument("--batch_sizes", type=str, default="1,4")
+    parser.add_argument("--prompt_lens", type=str, default="128")
+    parser.add_argument("--gen_lens", type=str, default="128")
+    parser.add_argument("--eval_runs", type=int, default=3)
     parser.add_argument(
-        "--gpus", type=str, default="0", help="CUDA_VISIBLE_DEVICES string"
+        "--kv_cache", type=float, default=2.5, help="GB reserved for KV cache"
     )
-    parser.add_argument(
-        "--vram_util",
-        type=float,
-        default=0.416,
-        help="GPU memory utilization (e.g., 0.416 for ~10GB on a 24GB GPU)",
-    )
-    parser.add_argument(
-        "--cpu_offload",
-        type=float,
-        default=40.0,
-        help="GB of CPU RAM for baseline offloading",
-    )
-    parser.add_argument("--max_len", type=int, default=2048, help="Max model length")
-    parser.add_argument(
-        "--prompt",
-        type=str,
-        default="Explain the history and architecture of deep learning accelerators in extreme detail.",
-        help="Input text",
-    )
-    parser.add_argument(
-        "--max_tokens", type=int, default=128, help="Max output tokens to generate"
-    )
-    parser.add_argument(
-        "--warmup_runs", type=int, default=2, help="Number of warmup runs"
-    )
-    parser.add_argument(
-        "--eval_runs", type=int, default=3, help="Number of evaluated runs to average"
-    )
+
     args = parser.parse_args()
 
-    res_baseline = {}
-    res_rans = {}
-    run_engine("baseline", args.baseline_model, args, res_baseline)
-    run_engine("rans", args.compressed_model, args, res_rans)
-    print(f"\n{'='*60}")
-    print("🏆 FINAL BENCHMARK SHOWDOWN 🏆")
-    print(f"{'='*60}")
-    print(f"VRAM Budget:    {args.vram_util * 100:.1f}%")
-    print(f'Prompt:         "{args.prompt[:40]}..."')
-    print("-" * 60)
-    print(
-        f"BASELINE Speed: {res_baseline['avg_toks_sec']:>6.2f} tokens/s (Uncompressed Offloading)"
-    )
-    print(
-        f"RANS Speed:     {res_rans['avg_toks_sec']:>6.2f} tokens/s (Compressed + Triton)"
-    )
-    print("-" * 60)
+    gpu_list = [int(x) for x in args.gpus.split(",")]
+    vram_utils = [float(x) for x in args.vram_utils.split(",")]
+    active_modes = [x.strip() for x in args.modes.split(",")]
 
-    if res_baseline["avg_toks_sec"] > 0:
-        speedup = res_rans["avg_toks_sec"] / res_baseline["avg_toks_sec"]
-        print(f"🚀 MULTIPLIER:  {speedup:.2f}x Faster Inference!")
-    else:
-        print("Error calculating multiplier: Baseline speed was 0.")
-    print(f"{'='*60}\n")
+    args_dict = vars(args)
+    args_dict["vram_utils"] = vram_utils
+    args_dict["batch_sizes"] = [int(x) for x in args.batch_sizes.split(",")]
+    args_dict["prompt_lens"] = [int(x) for x in args.prompt_lens.split(",")]
+    args_dict["gen_lens"] = [int(x) for x in args.gen_lens.split(",")]
 
-    # Print warmup vram utilization
-    print("VRAM Utilization check")
-    print(
-        f"Baseline: VRAM Allocated: {res_baseline['vram_used_gb']}, VRAM reserverd: {res_baseline['vram_allocated_gb']}"
-    )
-    print(
-        f"RANS: VRAM Allocated: {res_rans['vram_used_gb']}, VRAM reserverd: {res_rans['vram_allocated_gb']}"
-    )
+    print(f"🚀 STARTING PARALLEL BENCHMARK on GPUs: {gpu_list}")
+    print(f"🎯 Modes active: {active_modes}")
+    print("[1/2] Analyzing Models...")
+
+    base_bytes = get_dynamic_model_size(args.baseline_model)
+    rans_bytes = get_dynamic_model_size(args.compressed_model)
+    model_meta = {"base_bytes": base_bytes, "rans_bytes": rans_bytes}
+
+    print(f"   Baseline: {base_bytes/1e9:.2f} GB")
+    print(f"   rANS:     {rans_bytes/1e9:.2f} GB")
+
+    task_queue = multiprocessing.Queue()
+    result_queue = multiprocessing.Queue()
+
+    tasks = []
+    for util in vram_utils:
+        for mode in active_modes:
+            tasks.append((mode, util))
+
+    for t in tasks:
+        task_queue.put(t)
+
+    for _ in gpu_list:
+        task_queue.put(None)
+
+    workers = []
+    for gpu_id in gpu_list:
+        p = multiprocessing.Process(
+            target=benchmark_worker,
+            args=(gpu_id, task_queue, result_queue, args_dict, model_meta),
+        )
+        p.start()
+        workers.append(p)
+
+    filename = f"rans_sweep_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    output_data = {
+        "metadata": {
+            "timestamp": datetime.now().isoformat(),
+            "baseline_model": args.baseline_model,
+            "compressed_model": args.compressed_model,
+            "baseline_bytes": base_bytes,
+            "rans_bytes": rans_bytes,
+        },
+        "results": [],
+    }
+
+    with open(filename, "w") as f:
+        json.dump(output_data, f, indent=4)
+
+    completed_records = 0
+
+    try:
+        while any(p.is_alive() for p in workers) or not result_queue.empty():
+            try:
+                record = result_queue.get(timeout=1.0)
+                output_data["results"].append(record)
+                completed_records += 1
+
+                with open(filename, "w") as f:
+                    json.dump(output_data, f, indent=4)
+                    f.flush()
+
+                print(
+                    f"   [REC] {record['mode']} (Util: {record['vram_util_config']}) "
+                    f"-> {record['avg_toks_sec']:.1f} t/s | Offload: {record['cpu_offload_gb']:.1f}GB"
+                )
+
+            except multiprocessing.queues.Empty:
+                continue
+
+    except KeyboardInterrupt:
+        print("\n🛑 Interrupted! Terminating workers...")
+        for p in workers:
+            p.terminate()
+        for p in workers:
+            p.join()
+        sys.exit(1)
+
+    print(f"\n✅ Sweep Complete. {completed_records} records saved to {filename}")
 
 
 if __name__ == "__main__":

@@ -34,6 +34,7 @@ QuantizationMethods = Literal[
     "torchao",
     "auto-round",
     "rtn",
+    "baseline",
     "rans",
     "inc",
     "mxfp4",
@@ -145,6 +146,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .petit import PetitNvFp4Config
     from .ptpc_fp8 import PTPCFp8Config
     from .rans import RansConfig
+    from .baseline import BaselineQuantizationConfig
     from .rtn import RTNConfig
     from .torchao import TorchAOConfig
 
@@ -175,6 +177,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "auto-round": AutoRoundConfig,
         "rtn": RTNConfig,
         "rans": RansConfig,
+        "baseline": BaselineQuantizationConfig,
         "inc": INCConfig,
         "mxfp4": Mxfp4Config,
         "petit_nvfp4": PetitNvFp4Config,
