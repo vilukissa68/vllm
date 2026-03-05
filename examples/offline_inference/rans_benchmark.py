@@ -11,6 +11,7 @@ import numpy as np
 import multiprocessing
 from datetime import datetime
 from typing import Dict, Any, List
+from transformers import AutoConfig
 
 # Try importing pynvml for power monitoring
 try:
@@ -105,6 +106,9 @@ def benchmark_worker(
     Worker process that owns a specific GPU and processes benchmark tasks.
     """
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    os.environ[
+        "VLLM_TORCH_COMPILE_LEVEL"
+    ] = "0"  # Disable dynamo to protect rANS kernel
 
     # Import vLLM here to avoid CUDA context issues in parent
     import vllm
@@ -114,11 +118,59 @@ def benchmark_worker(
     if torch.cuda.is_available():
         torch.cuda.init()
         total_vram_bytes = torch.cuda.get_device_properties(0).total_memory
+        _ = torch.zeros(1, device="cuda")
+        free_mem, total_vram_bytes = torch.cuda.mem_get_info()
+        cuda_context_overhead = total_vram_bytes - free_mem
     else:
-        total_vram_bytes = 0
+        raise RuntimeError("CUDA is not available. This benchmark requires a GPU.")
 
     power_monitor = PowerMonitor(gpu_id=0)  # It sees itself as device 0 now
 
+    # --- STATIC OVERHEAD CALCULATION (Independent of mode) ---
+    print(f"[GPU {gpu_id}] Calculating static memory overhead...")
+    hf_config = AutoConfig.from_pretrained(
+        args_dict["baseline_model"], trust_remote_code=True
+    )
+
+    # 1. Calculate Exact KV Cache Bytes required for the largest sweep
+    num_layers = getattr(
+        hf_config, "num_hidden_layers", getattr(hf_config, "n_layer", 0)
+    )
+    num_kv_heads = getattr(
+        hf_config, "num_key_value_heads", getattr(hf_config, "num_attention_heads", 1)
+    )
+    head_dim = getattr(
+        hf_config,
+        "head_dim",
+        hf_config.hidden_size // getattr(hf_config, "num_attention_heads", 1),
+    )
+
+    bytes_per_token = (
+        2 * 2 * num_layers * num_kv_heads * head_dim
+    )  # 2 (K+V) * 2 bytes (fp16)
+    max_tokens_needed = max(args_dict["batch_sizes"]) * (
+        max(args_dict["prompt_lens"]) + max(args_dict["gen_lens"])
+    )
+    required_kv_bytes = max_tokens_needed * bytes_per_token
+    required_kv_bytes = max(required_kv_bytes, int(args_dict["kv_cache"] * (1024**3)))
+
+    # 2. Estimate Activation Memory (Hidden states during prefill)
+    max_prefill_tokens = max(args_dict["batch_sizes"]) * max(args_dict["prompt_lens"])
+    activation_bytes = max_prefill_tokens * hf_config.hidden_size * 2 * 4
+
+    # 3. Base fragmentation buffer
+    vllm_fragmentation_buffer = int(total_vram_bytes * 0.005)
+
+    # Pre-extract MLP dim for rANS workspace calculation later
+    mlp_dim = getattr(hf_config, "intermediate_size", hf_config.hidden_size * 4)
+
+    print("   Static Overhead Components:")
+    print(f"   - CUDA Context: {cuda_context_overhead/1e9:.2f} GB")
+    print(f"   - Max KV Cache: {required_kv_bytes/1e9:.2f} GB")
+    print(f"   - Activation Buffer: {activation_bytes/1e9:.2f} GB")
+    print(f"   - vLLM Fragmentation Buffer: {vllm_fragmentation_buffer/1e9:.2f} GB")
+
+    # --- TASK LOOP ---
     while True:
         task = task_queue.get()
         if task is None:  # Sentinel
@@ -127,25 +179,62 @@ def benchmark_worker(
         mode, vram_util = task
         print(f"[GPU {gpu_id}] Starting task: {mode} @ {vram_util*100:.0f}% VRAM")
 
-        # --- CONFIGURE BUDGET & OFFLOAD ---
-        target_gpu_bytes = int(total_vram_bytes * vram_util)
+        # --- DYNAMIC OVERHEAD (Dependent on mode) ---
+        if "rans" in mode:
+            # Matches your backend: MAX_BATCH_GUESS = 8192, Split-K = 8
+            rans_workspace_bytes = 8 * 8192 * mlp_dim * 2
+        else:
+            rans_workspace_bytes = 0
 
-        # Reserve strict amount for KV cache and PyTorch overhead
-        KV_RESERVE_BYTES = int(args_dict["kv_cache"] * (1024**3))
-        allowed_weight_budget = max(0, target_gpu_bytes - KV_RESERVE_BYTES)
+        DYNAMIC_RESERVE_BYTES = (
+            cuda_context_overhead
+            + required_kv_bytes
+            + activation_bytes
+            + rans_workspace_bytes
+            + vllm_fragmentation_buffer
+        )
+
+        print(
+            f"[GPU {gpu_id}] Dynamic Reserve Computed: {DYNAMIC_RESERVE_BYTES / 1e9:.2f} GB "
+            f"(Context: {cuda_context_overhead/1e9:.2f}G, KV: {required_kv_bytes/1e9:.2f}G, "
+            f"Acts: {activation_bytes/1e9:.2f}G, rANS WS: {rans_workspace_bytes/1e9:.2f}G)"
+        )
+
+        # --- EXACT SPILLOVER MATH ---
+        target_gpu_bytes = int(total_vram_bytes * vram_util)
 
         if "rans" in mode:
             os.environ["USE_RANS_JIT"] = "1" if "unfused" in mode else "0"
-            os.environ["RANS_WEIGHT_BUDGET_BYTES"] = str(allowed_weight_budget)
             model_path = args_dict["compressed_model"]
             model_bytes = model_meta["rans_bytes"]
+
+            # The weights allowed on GPU for rANS
+            allowed_weight_budget = max(0, target_gpu_bytes - DYNAMIC_RESERVE_BYTES)
+            os.environ["RANS_WEIGHT_BUDGET_BYTES"] = str(allowed_weight_budget)
         else:  # Baseline
             model_path = args_dict["baseline_model"]
             model_bytes = model_meta["base_bytes"]
 
-        # Calculate exactly how much spills over to CPU
-        offload_bytes = max(0, model_bytes - allowed_weight_budget)
-        cpu_offload_gb = offload_bytes / (1024**3)
+        # Calculate exact spillover required to fit into the target util boundary
+        actual_spillover_bytes = max(
+            0, model_bytes + DYNAMIC_RESERVE_BYTES - target_gpu_bytes
+        )
+        # Give 1% Error for spill_over to ensure vLLM definitely doesn't OOM
+        actual_spillover_bytes = int(actual_spillover_bytes * 1.01)
+        actual_spillover_gb = actual_spillover_bytes / (1024**3)
+
+        print(
+            f"[GPU {gpu_id}] Model Size: {model_bytes/1e9:.2f} GB | Target GPU Budget: {target_gpu_bytes/1e9:.2f} GB | "
+            f"Calculated Spillover: {actual_spillover_gb:.2f} GB"
+        )
+
+        print(
+            f" required_kv_bytes: {required_kv_bytes/1e9:.2f} GB | activation_bytes: {activation_bytes/1e9:.2f} GB | "
+        )
+        print(
+            f" rANS workspace: {rans_workspace_bytes/1e9:.2f} GB | Fragmentation buffer: {vllm_fragmentation_buffer/1e9:.2f} GB"
+        )
+        print(f" Total Dynamic Reserve: {DYNAMIC_RESERVE_BYTES/1e9:.2f} GB")
 
         # Clean slate
         if torch.cuda.is_available():
@@ -155,27 +244,57 @@ def benchmark_worker(
 
         # --- INITIALIZE ENGINE ---
         try:
-            llm = LLM(
-                model=model_path,
-                quantization="rans" if "rans" in mode else None,
-                dtype="bfloat16",
-                enforce_eager=True,
-                trust_remote_code=True,
-                gpu_memory_utilization=vram_util,
-                cpu_offload_gb=cpu_offload_gb,
-                max_model_len=max(args_dict["prompt_lens"])
-                + max(args_dict["gen_lens"])
-                + 128,
-                tensor_parallel_size=1,  # Always 1 per worker in this parallel scheme
-                disable_log_stats=True,
-            )
+            if args_dict["no_offload"]:
+                if mode == "baseline":
+                    llm = LLM(
+                        model=model_path,
+                        quantization="rans" if "rans" in mode else None,
+                        dtype="bfloat16",
+                        enforce_eager=True,
+                        trust_remote_code=True,
+                        max_model_len=max(args_dict["prompt_lens"])
+                        + max(args_dict["gen_lens"])
+                        + 128,
+                        tensor_parallel_size=1,
+                        disable_log_stats=True,
+                    )
+            else:
+                if mode == "baseline":
+                    llm = LLM(
+                        model=model_path,
+                        dtype="bfloat16",
+                        enforce_eager=True,
+                        trust_remote_code=True,
+                        gpu_memory_utilization=vram_util,
+                        # vLLM interprets this as EXACTLY how much to offload
+                        cpu_offload_gb=actual_spillover_gb,
+                        max_model_len=max(args_dict["prompt_lens"])
+                        + max(args_dict["gen_lens"])
+                        + 128,
+                        tensor_parallel_size=1,
+                        disable_log_stats=True,
+                    )
+                else:
+                    llm = LLM(
+                        model=model_path,
+                        quantization="rans",
+                        dtype="bfloat16",
+                        enforce_eager=True,
+                        trust_remote_code=True,
+                        gpu_memory_utilization=vram_util,
+                        # cpu_offload_gb=actual_spillover_gb, # Managed by RANS budget
+                        max_model_len=max(args_dict["prompt_lens"])
+                        + max(args_dict["gen_lens"])
+                        + 128,
+                        tensor_parallel_size=1,
+                        disable_log_stats=True,
+                    )
 
             # Extract Cache Stats (Tokens & GB)
             try:
                 cache_config = llm.llm_engine.cache_config
                 kv_cache_tokens = cache_config.num_gpu_blocks * cache_config.block_size
 
-                # Calculate GB using Model Config
                 hf_config = llm.llm_engine.model_config.hf_config
                 num_layers = getattr(
                     hf_config, "num_hidden_layers", getattr(hf_config, "n_layer", 0)
@@ -193,7 +312,6 @@ def benchmark_worker(
                         hf_config, "num_attention_heads", 1
                     )
 
-                # 2 (K+V) * 2 bytes (bf16) = 4 bytes per parameter
                 bytes_per_token = 4 * num_layers * num_kv_heads * head_dim
                 kv_cache_gb = (kv_cache_tokens * bytes_per_token) / (1024**3)
 
@@ -215,7 +333,6 @@ def benchmark_worker(
                             max_tokens=gl, temperature=0.0, ignore_eos=True
                         )
 
-                        # Warmup
                         try:
                             llm.generate(
                                 prompts=[{"prompt_token_ids": [100] * 10}],
@@ -261,7 +378,7 @@ def benchmark_worker(
                                 "gen_len": gl,
                                 "kv_cache_tokens": kv_cache_tokens,
                                 "kv_cache_gb": kv_cache_gb,
-                                "cpu_offload_gb": cpu_offload_gb,
+                                "cpu_offload_gb": actual_spillover_gb,
                                 "avg_toks_sec": float(np.mean(latencies))
                                 if latencies
                                 else 0.0,
@@ -311,7 +428,6 @@ def main():
     parser.add_argument("--compressed_model", type=str, required=True)
     parser.add_argument("--gpus", type=str, default="0")
 
-    # --- NEW: MODES TOGGLE ---
     parser.add_argument(
         "--modes",
         type=str,
@@ -328,6 +444,11 @@ def main():
     parser.add_argument("--eval_runs", type=int, default=3)
     parser.add_argument(
         "--kv_cache", type=float, default=2.5, help="GB reserved for KV cache"
+    )
+    parser.add_argument(
+        "--no_offload",
+        action="store_true",
+        help="Disable explicit CPU offload (for rANS)",
     )
 
     args = parser.parse_args()
@@ -406,7 +527,7 @@ def main():
 
                 print(
                     f"   [REC] {record['mode']} (Util: {record['vram_util_config']}) "
-                    f"-> {record['avg_toks_sec']:.1f} t/s | Offload: {record['cpu_offload_gb']:.1f}GB"
+                    f"-> {record['avg_toks_sec']:.1f} t/s | Actual Offload: {record['cpu_offload_gb']:.1f}GB"
                 )
 
             except multiprocessing.queues.Empty:

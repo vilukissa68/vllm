@@ -186,7 +186,7 @@ def plot_memory_wall(df, meta, output_dir, timestamp, target_batch_sizes=None):
         handles=handles,
         labels=new_labels,
         loc="upper center",
-        bbox_to_anchor=(0.5, -0.05), # Moved legend to bottom to save horizontal space
+        bbox_to_anchor=(0.5, -0.05),  # Moved legend to bottom to save horizontal space
         ncol=3,
         title=None,
         frameon=True,
@@ -226,7 +226,9 @@ def plot_offload_profile(df, meta, output_dir, timestamp):
     ax.set_ylabel("CPU Offload Size (GB)", fontweight="bold")
 
     model_name = meta.get("baseline_model", "Model").split("/")[-1]
-    ax.set_title(f"CPU Parameter Offloading Profile: {model_name}", pad=15, fontweight="bold")
+    ax.set_title(
+        f"CPU Parameter Offloading Profile: {model_name}", pad=15, fontweight="bold"
+    )
 
     handles, labels = ax.get_legend_handles_labels()
     new_labels = [LABELS.get(l, l) for l in labels]
@@ -256,7 +258,16 @@ def plot_kv_density(df, meta, output_dir, timestamp):
 
     for container in ax.containers:
         # Convert to 'k' format for readability if numbers are large
-        ax.bar_label(container, labels=[f"{int(v.get_height())//1000}k" if v.get_height() > 0 else "0" for v in container], padding=3, rotation=90, fontsize=8)
+        ax.bar_label(
+            container,
+            labels=[
+                f"{int(v.get_height())//1000}k" if v.get_height() > 0 else "0"
+                for v in container
+            ],
+            padding=3,
+            rotation=90,
+            fontsize=8,
+        )
 
     ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: format(int(x), ",")))
     ax.xaxis.set_major_formatter(ticker.PercentFormatter(xmax=1.0))
@@ -268,4 +279,99 @@ def plot_kv_density(df, meta, output_dir, timestamp):
 
     handles, labels = ax.get_legend_handles_labels()
     new_labels = [LABELS.get(l, l) for l in labels]
-    ax.legend(handles=handles, labels=new_labels, title=
+    ax.legend(handles=handles, labels=new_labels, title=None, loc="upper left")
+
+    fname = f"kv_density_{timestamp}.pdf"
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, fname))
+    plt.close()
+    print(f"Saved {fname}")
+
+
+def plot_energy_landscape(df, meta, output_dir, timestamp):
+    """PLOTS: Joules/Token (Y) vs VRAM Utilization (X)."""
+    if "joules_per_token" not in df.columns:
+        df["joules_per_token"] = df.apply(
+            lambda row: row["energy_j"] / (row["batch_size"] * row["gen_len"])
+            if row["energy_j"] > 0
+            else 0,
+            axis=1,
+        )
+
+    df_clean = df[df["energy_j"] > 0].copy()
+    if df_clean.empty:
+        return
+
+    max_bs = df_clean["batch_size"].max()
+    subset = df_clean[df_clean["batch_size"] == max_bs]
+
+    plt.figure(figsize=(FIG_WIDTH, FIG_HEIGHT))
+    ax = sns.barplot(
+        data=subset,
+        x="vram_util_config",
+        y="joules_per_token",
+        hue="mode",
+        palette=COLORS,
+        edgecolor="black",
+        hue_order=["baseline", "rans_unfused", "rans_fused"],
+    )
+
+    ax.xaxis.set_major_formatter(ticker.PercentFormatter(xmax=1.0))
+    ax.set_ylabel("Energy (Joules / Output Token) ↓", fontweight="bold")
+    ax.set_xlabel("VRAM Allocation Limit", fontweight="bold")
+    ax.set_title(f"Energy Efficiency @ Batch {max_bs}", pad=15, fontweight="bold")
+
+    handles, labels = ax.get_legend_handles_labels()
+    new_labels = [LABELS.get(l, l) for l in labels]
+    ax.legend(handles=handles, labels=new_labels, loc="upper right")
+
+    fname = f"energy_efficiency_{timestamp}.pdf"
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, fname))
+    plt.close()
+    print(f"Saved {fname}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate Publication Plots for rANS")
+    parser.add_argument("--file", type=str, default="latest", help="JSON result file")
+    parser.add_argument("--output", type=str, default=".", help="Output directory")
+    parser.add_argument(
+        "--plot_batch_sizes",
+        type=str,
+        default=None,
+        help="Comma-separated batch sizes to plot (e.g., '1,4')",
+    )
+    args = parser.parse_args()
+
+    if args.file == "latest":
+        json_files = glob.glob("rans_sweep_*.json")
+        if not json_files:
+            print("No JSON files found.")
+            return
+        args.file = max(json_files, key=os.path.getmtime)
+
+    df, meta = load_data(args.file)
+    if df is None:
+        return
+
+    target_batch_sizes = None
+    if args.plot_batch_sizes:
+        target_batch_sizes = [int(x) for x in args.plot_batch_sizes.split(",")]
+
+    ts_raw = meta.get("timestamp", "unknown")
+    timestamp = ts_raw.replace(":", "").replace("-", "").split(".")[0]
+
+    os.makedirs(args.output, exist_ok=True)
+    print(f"Generating plots for: {args.file}")
+
+    plot_memory_wall(df, meta, args.output, timestamp, target_batch_sizes)
+    plot_offload_profile(df, meta, args.output, timestamp)
+    plot_kv_density(df, meta, args.output, timestamp)
+    plot_energy_landscape(df, meta, args.output, timestamp)
+
+    print("\nDone. All plots generated.")
+
+
+if __name__ == "__main__":
+    main()
