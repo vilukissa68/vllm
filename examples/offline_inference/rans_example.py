@@ -42,7 +42,7 @@ def main():
     else:
         llm = LLM(
             model=args.model_path,
-            tokenizer="Qwen/Qwen3-14B",  # Use the same path for tokenizer if not quantized
+            tokenizer="Qwen/Qwen3-0.6B",  # Use the same path for tokenizer if not quantized
             dtype="bfloat16",  # Match your compression dtype
             enforce_eager=True,  # CRITICAL: Disable CUDA Graphs for dynamic loading
             trust_remote_code=True,

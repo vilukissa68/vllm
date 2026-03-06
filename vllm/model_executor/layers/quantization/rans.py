@@ -35,17 +35,20 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
 )
 
-
 try:
     from comp_inference import (
         ccore,
         reconstruct_from_exp_and_mantissa,
         fused_rans_linear_triton,
+        fused_rans_linear_triton_uncoalesced,
         fused_rans_linear_transposed_triton,
+        fused_rans_linear_transposed_triton_uncoalesced,
         rans_decomp_triton,
         uninterleave_mantissas,
         rans_decomp_triton_tiled,
         fused_rans_embedding_triton,
+        fused_rans_embedding_triton_uncoalesced,
+        triton_matmul,
     )
 
     print("SUCCESS: comp_inference loaded.")
@@ -59,6 +62,20 @@ from safetensors import safe_open
 import os
 
 USE_RANS_JIT = os.environ.get("USE_RANS_JIT", "0") == "1"
+
+
+def compute_stream_sizes(stream_offsets, compressed_stream, device):
+    """
+    Computes stream sizes by subtracting adjacent offsets.
+    Safely casts to int64 because PyTorch lacks CUDA subtraction kernels for uint32.
+    """
+    offsets_i64 = stream_offsets.to(torch.int64)
+    total_bytes = torch.tensor(
+        [compressed_stream.numel()], dtype=torch.int64, device=device
+    )
+    shifted_offsets = torch.cat([offsets_i64[1:], total_bytes])
+
+    return (shifted_offsets - offsets_i64).to(torch.uint32)
 
 
 # Inside your RansConfig or where you initialize it
@@ -106,6 +123,7 @@ class RansConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
+        # if isinstance(layer, LinearBase):
         if isinstance(layer, LinearBase):
             return RansLinearMethod(self, prefix)
         elif isinstance(layer, VocabParallelEmbedding):
@@ -166,6 +184,11 @@ def register_rans_parameters(
     layer.ts = tp_rank * layer.nl
     layer.te = layer.ts + layer.nl
 
+    # Check for dense packing
+    # is_uncoalesced = getattr(quant_config, "uncoalesced_interleaving", False)
+    # is_uncoalesced = layer.uncoalesced_interleaving
+    is_uncoalesced = getattr(layer, "uncoalesced_interleaving", False)
+
     # --- THE LOADER ---
     def rans_loader(param, loaded_weight, shard_id=None):
         param_name = getattr(param, "rans_name", "")
@@ -175,20 +198,48 @@ def register_rans_parameters(
         ts, te = layer.ts, layer.te
 
         # Slice the 2D grid for Tensor Parallelism if necessary
-        if any(x in param_name for x in ["offsets", "max_lens"]):
-            expected_global = nk_local * ng_local
-            grid = loaded_weight[:expected_global].view(nk_local, ng_local)
-            loaded_weight = grid[:, ts:te].contiguous().view(-1)
-        elif "states" in param_name:
-            grid = loaded_weight.view(nk_local, ng_local, 2, layer.tile_width)
-            loaded_weight = grid[:, ts:te, :].contiguous().view(-1)
+        # if any(x in param_name for x in ["offsets", "max_lens"]):
+        #     expected_global = nk_local * ng_local
+        #     grid = loaded_weight[:expected_global].view(nk_local, ng_local)
+        #     loaded_weight = grid[:, ts:te].contiguous().view(-1)
+        # elif "states" in param_name:
+        #     grid = loaded_weight.view(nk_local, ng_local, 2, layer.tile_width)
+        #     loaded_weight = grid[:, ts:te, :].contiguous().view(-1)
+
+        if any(x in param_name for x in ["offsets", "max_lens", "states"]):
+            if is_uncoalesced and param_name in [
+                "rans_exp_stream_offsets",
+                "rans_exp_states",
+            ]:
+                # DENSE PACKING: 1 value per stream. Shape: [nk, ng * tile_width]
+                grid = loaded_weight.view(nk_local, ng_local * layer.tile_width)
+                loaded_weight = (
+                    grid[:, ts * layer.tile_width : te * layer.tile_width]
+                    .contiguous()
+                    .view(-1)
+                )
+
+            elif not is_uncoalesced and param_name == "rans_exp_states":
+                # LEGACY ILP2 STATES: [nk, ng, 2, tw]
+                grid = loaded_weight.view(nk_local, ng_local, 2, layer.tile_width)
+                loaded_weight = grid[:, ts:te, :].contiguous().view(-1)
+
+            elif not is_uncoalesced and param_name in [
+                "rans_exp_tile_offsets",
+                "rans_exp_tile_max_lens",
+            ]:
+                # LEGACY TILE ARRAYS: 1 value per tile. Shape [nk, ng]
+                expected_global = nk_local * ng_local
+                grid = loaded_weight[:expected_global].view(nk_local, ng_local)
+                loaded_weight = grid[:, ts:te].contiguous().view(-1)
+
         elif "man_raw" in param_name:
             grid = loaded_weight.view(
                 nk_local, ng_local, layer.tile_height, layer.tile_width
             )
             loaded_weight = grid[:, ts:te, :, :].contiguous().view(-1)
+
         elif "info" in param_name:
-            # 1. Parse Dimensions from the raw tensor
             info = loaded_weight.cpu().tolist()
             rank = info[6]
             global_shape = info[11 : 11 + rank]
@@ -281,11 +332,19 @@ def register_rans_parameters(
         # "exp_sizes": torch.uint32,
         "exp_tables": torch.uint32,
         "exp_slot_map": torch.uint16,
-        "exp_tile_offsets": torch.uint32,
-        "exp_tile_max_lens": torch.uint32,
+        # "exp_tile_offsets": torch.uint32,
+        # "exp_tile_max_lens": torch.uint32,
     }
+
     for name, dtype in exp_params.items():
         create_param(name, dtype)
+
+        # Conditionally create the correct offset/size tracking arrays
+    if is_uncoalesced:
+        create_param("exp_stream_offsets", torch.uint32)
+    else:
+        create_param("exp_tile_offsets", torch.uint32)
+        create_param("exp_tile_max_lens", torch.uint32)
 
     man_params = {
         "man_raw": torch.uint8,
@@ -318,6 +377,10 @@ class RansLinearMethod(LinearMethodBase):
             "tile_width", self.quant_config.default_tw
         )
 
+        layer.uncoalesced_interleaving = layer_settings.get(
+            "uncoalesced_interleaving", False
+        )
+
         layer.nk = (input_size + layer.tile_height - 1) // layer.tile_height
         layer.ng = (output_size + layer.tile_width - 1) // layer.tile_width
         layer.rans_shape = (input_size, sum(output_partition_sizes))
@@ -339,6 +402,8 @@ class RansLinearMethod(LinearMethodBase):
 
         tile_k = layer.tile_height
         tile_n = layer.tile_width
+
+        is_uncoalesced = layer.uncoalesced_interleaving
 
         # Helper to move tensors
         def _get(p):
@@ -382,23 +447,54 @@ class RansLinearMethod(LinearMethodBase):
         M = x.view(-1, K).shape[0]
         workspace = RansWorkspace.get_workspace(M, N, layer.split_k, device)
 
-        # Fused kernel
-        fused_result = fused_rans_linear_triton(
-            x=x,
-            compressed_data=_get(layer.rans_exp_stream),
-            initial_states=_get(layer.rans_exp_states).to(torch.uint32),
-            tables=_get(layer.rans_exp_tables),
-            slot_map=_get(layer.rans_exp_slot_map),
-            weight_shape=(K, N),
-            tile_offsets=_get(layer.rans_exp_tile_offsets).to(torch.uint32),
-            tile_max_lens=_get(layer.rans_exp_tile_max_lens).to(torch.uint32),
-            tile_k=tile_k,
-            tile_n=tile_n,
-            mantissas=_get(layer.rans_man_raw).to(torch.uint8),
-            bias=_get(bias),
-            SPLIT_K=layer.split_k,
-            workspace=workspace,
-        )
+        if is_uncoalesced:
+            stream_offsets = _get(layer.rans_exp_stream_offsets).to(torch.uint32)
+            compressed_stream = _get(layer.rans_exp_stream)
+
+            # stream_sizes[i] = stream_offsets[i+1] - stream_offsets[i]
+            # The final stream size uses the total byte length of the stream array
+            total_bytes = torch.tensor(
+                [compressed_stream.numel()], dtype=torch.uint32, device=device
+            )
+
+            stream_sizes = compute_stream_sizes(
+                stream_offsets, compressed_stream, device
+            )
+
+            fused_result = fused_rans_linear_triton_uncoalesced(
+                x=x,
+                compressed_data=compressed_stream,
+                initial_states=_get(layer.rans_exp_states).to(torch.uint32),
+                tables=_get(layer.rans_exp_tables),
+                slot_map=_get(layer.rans_exp_slot_map),
+                weight_shape=(K, N),
+                stream_offsets=stream_offsets,
+                stream_sizes=stream_sizes,
+                tile_k=tile_k,
+                tile_n=tile_n,
+                mantissas=_get(layer.rans_man_raw),
+                bias=_get(bias),
+                SPLIT_K=layer.split_k,
+                workspace=workspace,
+            )
+        else:
+            # Fused kernel
+            fused_result = fused_rans_linear_triton(
+                x=x,
+                compressed_data=_get(layer.rans_exp_stream),
+                initial_states=_get(layer.rans_exp_states).to(torch.uint32),
+                tables=_get(layer.rans_exp_tables),
+                slot_map=_get(layer.rans_exp_slot_map),
+                weight_shape=(K, N),
+                tile_offsets=_get(layer.rans_exp_tile_offsets).to(torch.uint32),
+                tile_max_lens=_get(layer.rans_exp_tile_max_lens).to(torch.uint32),
+                tile_k=tile_k,
+                tile_n=tile_n,
+                mantissas=_get(layer.rans_man_raw),
+                bias=_get(bias),
+                SPLIT_K=layer.split_k,
+                workspace=workspace,
+            )
         return fused_result
 
 
@@ -423,6 +519,10 @@ class RansEmbeddingMethod(LinearMethodBase):  # Inherits the same vLLM quant bas
         )
         layer.tile_width = layer_settings.get(
             "tile_width", self.quant_config.default_tw
+        )
+
+        layer.uncoalesced_interleaving = layer_settings.get(
+            "uncoalesced_interleaving", False
         )
 
         local_hidden_size = (
@@ -450,6 +550,8 @@ class RansEmbeddingMethod(LinearMethodBase):  # Inherits the same vLLM quant bas
 
         tile_k = layer.tile_height
         tile_n = layer.tile_width
+
+        is_uncoalesced = layer.uncoalesced_interleaving
 
         def _get(p):
             return (
@@ -481,19 +583,48 @@ class RansEmbeddingMethod(LinearMethodBase):  # Inherits the same vLLM quant bas
                 x, reassembled_weight_local
             )
             return reference_result
-        fused_result = fused_rans_embedding_triton(
-            x=x,
-            compressed_data=_get(layer.rans_exp_stream),
-            initial_states=_get(layer.rans_exp_states).to(torch.uint32),
-            tables=_get(layer.rans_exp_tables).to(torch.uint32),
-            slot_map=_get(layer.rans_exp_slot_map).to(torch.uint16),
-            weight_shape=(K, N),
-            tile_offsets=_get(layer.rans_exp_tile_offsets).to(torch.uint32),
-            tile_max_lens=_get(layer.rans_exp_tile_max_lens).to(torch.uint32),
-            tile_k=tile_k,
-            tile_n=tile_n,
-            mantissas=_get(layer.rans_man_raw).to(torch.uint16),
-        )
+
+        if is_uncoalesced:
+            stream_offsets = _get(layer.rans_exp_stream_offsets).to(torch.uint32)
+            compressed_stream = _get(layer.rans_exp_stream)
+
+            # stream_sizes[i] = stream_offsets[i+1] - stream_offsets[i]
+            # The final stream size uses the total byte length of the stream array
+            total_bytes = torch.tensor(
+                [compressed_stream.numel()], dtype=torch.uint32, device=device
+            )
+            stream_sizes = compute_stream_sizes(
+                stream_offsets, compressed_stream, device
+            )
+
+            fused_result = fused_rans_embedding_triton_uncoalesced(
+                x=x,
+                compressed_data=compressed_stream,
+                initial_states=_get(layer.rans_exp_states).to(torch.uint32),
+                tables=_get(layer.rans_exp_tables),
+                slot_map=_get(layer.rans_exp_slot_map),
+                weight_shape=(K, N),
+                stream_offsets=stream_offsets,
+                stream_sizes=stream_sizes,  # Passing the dynamically calculated sizes!
+                tile_k=tile_k,
+                tile_n=tile_n,
+                mantissas=_get(layer.rans_man_raw),
+            )
+
+        else:
+            fused_result = fused_rans_embedding_triton(
+                x=x,
+                compressed_data=_get(layer.rans_exp_stream),
+                initial_states=_get(layer.rans_exp_states).to(torch.uint32),
+                tables=_get(layer.rans_exp_tables),
+                slot_map=_get(layer.rans_exp_slot_map),
+                weight_shape=(K, N),
+                tile_offsets=_get(layer.rans_exp_tile_offsets).to(torch.uint32),
+                tile_max_lens=_get(layer.rans_exp_tile_max_lens).to(torch.uint32),
+                tile_k=tile_k,
+                tile_n=tile_n,
+                mantissas=_get(layer.rans_man_raw),
+            )
         return fused_result
 
     def apply(self, layer, x, bias=None) -> torch.Tensor:
@@ -503,6 +634,8 @@ class RansEmbeddingMethod(LinearMethodBase):  # Inherits the same vLLM quant bas
 
         tile_k = layer.tile_height
         tile_n = layer.tile_width
+
+        is_uncoalesced = layer.uncoalesced_interleaving
 
         def _get(p):
             return (
@@ -537,19 +670,93 @@ class RansEmbeddingMethod(LinearMethodBase):  # Inherits the same vLLM quant bas
 
         workspace = RansWorkspace.get_workspace(M, K, layer.split_k, device)
 
-        fused_result = fused_rans_linear_transposed_triton(
-            x=x,
-            compressed_data=_get(layer.rans_exp_stream),
-            initial_states=_get(layer.rans_exp_states).to(torch.uint32),
-            tables=_get(layer.rans_exp_tables),
-            slot_map=_get(layer.rans_exp_slot_map),
-            weight_shape=(K, N),
-            tile_offsets=_get(layer.rans_exp_tile_offsets).to(torch.uint32),
-            tile_max_lens=_get(layer.rans_exp_tile_max_lens).to(torch.uint32),
-            tile_k=tile_k,
-            tile_n=tile_n,
-            mantissas=_get(layer.rans_man_raw).to(torch.uint16),
-            workspace=workspace,
-            SPLIT_K=layer.split_k,
-        )
+        if is_uncoalesced:
+            stream_offsets = _get(layer.rans_exp_stream_offsets).to(torch.uint32)
+            compressed_stream = _get(layer.rans_exp_stream)
+
+            # stream_sizes[i] = stream_offsets[i+1] - stream_offsets[i]
+            # The final stream size uses the total byte length of the stream array
+            total_bytes = torch.tensor(
+                [compressed_stream.numel()], dtype=torch.uint32, device=device
+            )
+            stream_sizes = compute_stream_sizes(
+                stream_offsets, compressed_stream, device
+            )
+
+            fused_result = fused_rans_linear_transposed_triton_uncoalesced(
+                x=x,
+                compressed_data=compressed_stream,
+                initial_states=_get(layer.rans_exp_states).to(torch.uint32),
+                tables=_get(layer.rans_exp_tables),
+                slot_map=_get(layer.rans_exp_slot_map),
+                weight_shape=(K, N),
+                stream_offsets=stream_offsets,
+                stream_sizes=stream_sizes,
+                tile_k=tile_k,
+                tile_n=tile_n,
+                mantissas=_get(layer.rans_man_raw),
+                workspace=workspace,
+                SPLIT_K=layer.split_k,
+            )
+
+        else:
+            fused_result = fused_rans_linear_transposed_triton(
+                x=x,
+                compressed_data=_get(layer.rans_exp_stream),
+                initial_states=_get(layer.rans_exp_states).to(torch.uint32),
+                tables=_get(layer.rans_exp_tables),
+                slot_map=_get(layer.rans_exp_slot_map),
+                weight_shape=(K, N),
+                tile_offsets=_get(layer.rans_exp_tile_offsets).to(torch.uint32),
+                tile_max_lens=_get(layer.rans_exp_tile_max_lens).to(torch.uint32),
+                tile_k=tile_k,
+                tile_n=tile_n,
+                mantissas=_get(layer.rans_man_raw),
+                workspace=workspace,
+                SPLIT_K=layer.split_k,
+            )
         return fused_result
+
+
+def patch_logits_processor_for_rans(model):
+    """
+    Overrides the default vLLM LogitsProcessor to use our fused rANS kernel
+    instead of the standard PyTorch F.linear.
+    """
+    original_forward = model.logits_processor.forward
+
+    def fused_rans_logits_forward(hidden_states, gathered_weight, *args, **kwargs):
+        # gathered_weight is usually embed_tokens.weight.
+        # We ignore it and grab our compressed parameters directly from the embedding layer!
+        embed_layer = model.model.embed_tokens
+
+        # If the embedding layer is rANS compressed
+        if hasattr(embed_layer, "rans_exp_stream"):
+            device = hidden_states.device
+            N, K = embed_layer.rans_shape  # Vocab size, Hidden size
+
+            # The exact same math as your Linear layer: hidden_states @ W^T
+            logits = fused_rans_linear_transposed_triton(
+                x=hidden_states,
+                compressed_data=embed_layer.rans_exp_stream,
+                initial_states=embed_layer.rans_exp_states,
+                tables=embed_layer.rans_exp_tables,
+                slot_map=embed_layer.rans_exp_slot_map,
+                weight_shape=(K, N),
+                tile_offsets=embed_layer.rans_exp_tile_offsets,
+                tile_max_lens=embed_layer.rans_exp_tile_max_lens,
+                tile_k=embed_layer.tile_height,
+                tile_n=embed_layer.tile_width,
+                mantissas=embed_layer.rans_man_raw,
+                workspace=RansWorkspace.get_workspace(
+                    hidden_states.shape[0], K, embed_layer.split_k, device
+                ),
+                SPLIT_K=embed_layer.split_k,
+            )
+            return logits
+
+        # Fallback for uncompressed models
+        return original_forward(hidden_states, gathered_weight, *args, **kwargs)
+
+    # Apply the patch
+    model.logits_processor.forward = fused_rans_logits_forward
