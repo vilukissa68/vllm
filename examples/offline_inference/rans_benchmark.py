@@ -47,7 +47,75 @@ def get_dynamic_model_size(model_path: str) -> int:
     return total_bytes
 
 
-# --- HELPER: POWER MONITOR ---
+# --- HELPER: RAPL CPU/RAM POWER MONITOR ---
+class RAPLMonitor:
+    """Reads Intel/AMD RAPL energy counters directly from Linux sysfs."""
+
+    def __init__(self):
+        self.cpu_paths = []
+        self.ram_paths = []
+        self.available = False
+
+        base_dir = "/sys/class/powercap/"
+        if not os.path.exists(base_dir):
+            return
+
+        try:
+            for d in os.listdir(base_dir):
+                if d.startswith("intel_rapl:"):
+                    pkg_dir = os.path.join(base_dir, d)
+                    name_file = os.path.join(pkg_dir, "name")
+                    energy_file = os.path.join(pkg_dir, "energy_uj")
+
+                    # Identify CPU Package
+                    if os.path.exists(name_file) and os.path.exists(energy_file):
+                        with open(name_file, "r") as f:
+                            name = f.read().strip()
+                        if "package" in name:
+                            self.cpu_paths.append(energy_file)
+
+                    # Identify DRAM (System RAM)
+                    for sub_d in os.listdir(pkg_dir):
+                        if sub_d.startswith(f"{d}:"):
+                            sub_dir = os.path.join(pkg_dir, sub_d)
+                            sub_name_file = os.path.join(sub_dir, "name")
+                            sub_energy_file = os.path.join(sub_dir, "energy_uj")
+
+                            if os.path.exists(sub_name_file) and os.path.exists(
+                                sub_energy_file
+                            ):
+                                with open(sub_name_file, "r") as f:
+                                    sub_name = f.read().strip()
+                                if "dram" in sub_name:
+                                    self.ram_paths.append(sub_energy_file)
+
+            self.available = len(self.cpu_paths) > 0
+            if self.available:
+                print(
+                    f"[RAPL] Found {len(self.cpu_paths)} CPU(s) and {len(self.ram_paths)} RAM node(s)."
+                )
+        except Exception as e:
+            print(f"[Warn] RAPL initialization failed: {e}")
+            self.available = False
+
+    def _read_energy(self, paths):
+        total_uj = 0
+        for p in paths:
+            try:
+                with open(p, "r") as f:
+                    total_uj += int(f.read().strip())
+            except PermissionError:
+                print(f"[Warn] Permission denied reading RAPL. See instructions below.")
+                self.available = False
+            except Exception:
+                pass
+        return total_uj
+
+    def get_energy_uj(self):
+        return self._read_energy(self.cpu_paths), self._read_energy(self.ram_paths)
+
+
+# --- HELPER: COMBINED POWER MONITOR ---
 class PowerMonitor:
     def __init__(self, gpu_id=0, interval=0.1):
         self.interval = interval
@@ -55,18 +123,23 @@ class PowerMonitor:
         self.power_readings = []
         self.thread = None
         self.gpu_id = gpu_id
-        self.available = False
+        self.gpu_available = False
+
+        # Initialize RAPL Monitor
+        self.rapl = RAPLMonitor()
+        self.start_cpu_uj = 0
+        self.start_ram_uj = 0
 
         if PYNVML_AVAILABLE:
             try:
                 pynvml.nvmlInit()
                 self.handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
-                self.available = True
+                self.gpu_available = True
             except Exception:
                 pass
 
-    def _record(self):
-        while self.is_recording and self.available:
+    def _record_gpu(self):
+        while self.is_recording and self.gpu_available:
             try:
                 power_mw = pynvml.nvmlDeviceGetPowerUsage(self.handle)
                 self.power_readings.append(power_mw / 1000.0)
@@ -76,9 +149,14 @@ class PowerMonitor:
 
     def start(self):
         self.power_readings = []
+
+        # Snapshot RAPL accumulators
+        if self.rapl.available:
+            self.start_cpu_uj, self.start_ram_uj = self.rapl.get_energy_uj()
+
         self.is_recording = True
-        if self.available:
-            self.thread = threading.Thread(target=self._record)
+        if self.gpu_available:
+            self.thread = threading.Thread(target=self._record_gpu)
             self.thread.start()
 
     def stop(self):
@@ -86,12 +164,28 @@ class PowerMonitor:
         if self.thread is not None:
             self.thread.join()
 
-        if not self.power_readings:
-            return 0.0, 0.0
+        # 1. Calculate GPU Energy (via polling integration)
+        avg_gpu_power = 0.0
+        gpu_energy_j = 0.0
+        if self.power_readings:
+            avg_gpu_power = sum(self.power_readings) / len(self.power_readings)
+            gpu_energy_j = sum(p * self.interval for p in self.power_readings)
 
-        avg_power = sum(self.power_readings) / len(self.power_readings)
-        total_energy_joules = sum(p * self.interval for p in self.power_readings)
-        return avg_power, total_energy_joules
+        # 2. Calculate CPU & RAM Energy (via hardware accumulators)
+        cpu_energy_j = 0.0
+        ram_energy_j = 0.0
+        if self.rapl.available:
+            end_cpu_uj, end_ram_uj = self.rapl.get_energy_uj()
+
+            # Handle hardware counter wrap-around (rare but possible)
+            cpu_diff_uj = max(0, end_cpu_uj - self.start_cpu_uj)
+            ram_diff_uj = max(0, end_ram_uj - self.start_ram_uj)
+
+            # Convert microjoules to joules
+            cpu_energy_j = cpu_diff_uj / 1_000_000.0
+            ram_energy_j = ram_diff_uj / 1_000_000.0
+
+        return avg_gpu_power, gpu_energy_j, cpu_energy_j, ram_energy_j
 
 
 # --- WORKER FUNCTION ---
@@ -154,12 +248,18 @@ def benchmark_worker(
     required_kv_bytes = max_tokens_needed * bytes_per_token
     required_kv_bytes = max(required_kv_bytes, int(args_dict["kv_cache"] * (1024**3)))
 
+    # Ensure we get the correct hidden size dimension
+    hidden_size = getattr(hf_config, "hidden_size", getattr(hf_config, "d_model", 4096))
+    if hidden_size == 0:
+        hidden_size = 5120
+
     # 2. Estimate Activation Memory (Hidden states during prefill)
     max_prefill_tokens = max(args_dict["batch_sizes"]) * max(args_dict["prompt_lens"])
+    activation_bytes = max_prefill_tokens * hidden_size * 2 * 4
     activation_bytes = max_prefill_tokens * hf_config.hidden_size * 2 * 4
 
     # 3. Base fragmentation buffer
-    vllm_fragmentation_buffer = int(total_vram_bytes * 0.005)
+    vllm_fragmentation_buffer = int(total_vram_bytes * 0.02)
 
     # Pre-extract MLP dim for rANS workspace calculation later
     mlp_dim = getattr(hf_config, "intermediate_size", hf_config.hidden_size * 4)
@@ -242,26 +342,53 @@ def benchmark_worker(
             torch.cuda.empty_cache()
             gc.collect()
 
+        if mode == "baseline":
+            quantization = None
+        elif mode == "triton_baseline":
+            quantization = "triton_baseline"
+        elif mode == "rans_fused":
+            quantization = "rans"
+        elif mode == "rans_unfused":
+            quantization = "rans"
+        else:
+            print(f"[GPU {gpu_id}] Unknown mode: {mode}")
+            continue
+
         # --- INITIALIZE ENGINE ---
         try:
             if args_dict["no_offload"]:
+                llm = LLM(
+                    model=model_path,
+                    quantization=quantization,
+                    dtype="bfloat16",
+                    enforce_eager=True,
+                    trust_remote_code=True,
+                    max_model_len=max(args_dict["prompt_lens"])
+                    + max(args_dict["gen_lens"])
+                    + 128,
+                    tensor_parallel_size=1,
+                    disable_log_stats=True,
+                )
+            else:
                 if mode == "baseline":
                     llm = LLM(
                         model=model_path,
-                        quantization="rans" if "rans" in mode else None,
                         dtype="bfloat16",
                         enforce_eager=True,
                         trust_remote_code=True,
+                        gpu_memory_utilization=vram_util,
+                        # vLLM interprets this as EXACTLY how much to offload
+                        cpu_offload_gb=actual_spillover_gb,
                         max_model_len=max(args_dict["prompt_lens"])
                         + max(args_dict["gen_lens"])
                         + 128,
                         tensor_parallel_size=1,
                         disable_log_stats=True,
                     )
-            else:
-                if mode == "baseline":
+                elif mode == "triton_baseline":
                     llm = LLM(
                         model=model_path,
+                        quantization="triton_baseline",
                         dtype="bfloat16",
                         enforce_eager=True,
                         trust_remote_code=True,
@@ -343,8 +470,10 @@ def benchmark_worker(
                             pass
 
                         latencies = []
-                        powers = []
-                        energies = []
+                        gpu_powers = []
+                        gpu_energies = []
+                        cpu_energies = []
+                        ram_energies = []
 
                         torch.cuda.reset_peak_memory_stats()
 
@@ -356,15 +485,22 @@ def benchmark_worker(
                                     prompts=prompts, sampling_params=sp, use_tqdm=False
                                 )
                                 t1 = time.perf_counter()
-                                p_avg, e_total = power_monitor.stop()
+                                (
+                                    avg_gpu_power,
+                                    gpu_energy,
+                                    cpu_energy,
+                                    ram_energy,
+                                ) = power_monitor.stop()
 
                                 gen_tokens = sum(
                                     len(o.outputs[0].token_ids) for o in req_outputs
                                 )
                                 if gen_tokens > 0:
                                     latencies.append(gen_tokens / (t1 - t0))
-                                powers.append(p_avg)
-                                energies.append(e_total)
+                                gpu_powers.append(avg_gpu_power)
+                                gpu_energies.append(gpu_energy)
+                                cpu_energies.append(cpu_energy)
+                                ram_energies.append(ram_energy)
 
                             peak_allocated = torch.cuda.max_memory_allocated()
                             peak_reserved = torch.cuda.max_memory_reserved()
@@ -382,11 +518,17 @@ def benchmark_worker(
                                 "avg_toks_sec": float(np.mean(latencies))
                                 if latencies
                                 else 0.0,
-                                "avg_power_w": float(np.mean(powers))
-                                if powers
+                                "avg_power_w": float(np.mean(gpu_powers))
+                                if gpu_powers
                                 else 0.0,
-                                "energy_j": float(np.mean(energies))
-                                if energies
+                                "gpu_energy_j": float(np.mean(gpu_energies))
+                                if gpu_energies
+                                else 0.0,
+                                "cpu_energy_j": float(np.mean(cpu_energies))
+                                if cpu_energies
+                                else 0.0,
+                                "ram_energy_j": float(np.mean(ram_energies))
+                                if ram_energies
                                 else 0.0,
                                 "peak_allocated_gb": peak_allocated / (1024**3),
                                 "peak_reserved_gb": peak_reserved / (1024**3),

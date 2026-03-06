@@ -46,6 +46,7 @@ try:
         uninterleave_mantissas,
         rans_decomp_triton_tiled,
         fused_rans_embedding_triton,
+        triton_matmul,
     )
 
     print("SUCCESS: comp_inference loaded.")
